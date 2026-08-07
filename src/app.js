@@ -6,16 +6,10 @@ import cron from 'node-cron';
 
 import config from './config/application.js';
 import { initializeDatabase } from './utils/database.js';
-import { getGuildConfig } from './services/config/guildConfig.js';
-import { getServerCounters, saveServerCounters, updateCounter } from './services/serverstatsService.js';
 import { logger, startupLog, shutdownLog } from './utils/logger.js';
 import { checkBirthdays } from './services/birthdayService.js';
-import { checkGiveaways } from './services/giveawayService.js';
 import { loadCommands, registerCommands as registerSlashCommands } from './handlers/loaders/commandLoader.js';
 import { registerCriticalSlashCommands } from './services/criticalSlashRegistration.js';
-import { runSafeTask, handleTaskError, ErrorCodes } from './utils/errorHandler.js';
-import { initializeMusic } from './services/music/riffySetup.js';
-import { shutdownMusic } from './services/music/playerHandler.js';
 import pkg from '../package.json' with { type: 'json' };
 import { EXPECTED_SCHEMA_VERSION, EXPECTED_SCHEMA_LABEL } from './config/database/schemaVersion.js';
 
@@ -63,12 +57,11 @@ class TitanBot extends Client {
       startupLog('Loading handlers...');
       await this.loadHandlers();
       startupLog('Handlers loaded');
-      initializeMusic(this);
       startupLog('Logging into Discord...');
       await this.login(this.config.bot.token);
       startupLog(`Discord login successful as ${this.user?.tag || this.user?.id}`);
 
-      startupLog(`Registering slash commands ${this.config.bot.guildId ? `to guild ${this.config.bot.guildId}` : 'globally'}...`);
+      startupLog(`Registering slash commands to guild ${this.config.bot.guildId}...`);
       await this.registerCommands();
       startupLog('Slash commands registration complete');
 
@@ -131,24 +124,6 @@ class TitanBot extends Client {
 
   setupCronJobs() {
     cron.schedule('0 6 * * *', runSafeTask('birthday_check', () => checkBirthdays(this)));
-    cron.schedule('* * * * *', runSafeTask('giveaway_check', () => checkGiveaways(this)));
-    cron.schedule('*/15 * * * *', runSafeTask('counter_update', () => this.updateAllCounters()));
-  }
-
-  async updateAllCounters() {
-    if (!this.db) return;
-    for (const [guildId, guild] of this.guilds.cache) {
-      try {
-        const counters = await getServerCounters(this, guildId); const validCounters = [];
-        for (const counter of counters) {
-          if (counter && counter.type && counter.channelId && counter.enabled !== false) {
-            const channel = guild.channels.cache.get(counter.channelId);
-            if (channel) { validCounters.push(counter); await updateCounter(this, guild, counter); }
-          }
-        }
-        if (validCounters.length !== counters.length) await saveServerCounters(this, guildId, validCounters);
-      } catch (error) { logger.error(`Error updating counters for guild ${guildId}:`, error); }
-    }
   }
 
   async loadHandlers() {
@@ -189,7 +164,7 @@ class TitanBot extends Client {
   async shutdown(reason = 'UNKNOWN') {
     shutdownLog(`Bot is shutting down (${reason})...`);
     try {
-      cron.getTasks().forEach(task => task.stop()); await shutdownMusic(this);
+      cron.getTasks().forEach(task => task.stop());
       if (this.webServer) await new Promise(resolve => this.webServer.close(resolve));
       if (this.db && this.db.db) { try { if (this.db.db.pool) await this.db.db.pool.end(); else if (typeof this.db.db.close === 'function') await this.db.db.close(); } catch (error) { logger.warn(`Database close warning: ${error.message}`); } }
       this.destroy(); shutdownLog('Bot shutdown complete.');
