@@ -10,6 +10,7 @@ import { logger, startupLog, shutdownLog } from './utils/logger.js';
 import { checkBirthdays } from './services/birthdayService.js';
 import { loadCommands, registerCommands as registerSlashCommands } from './handlers/loaders/commandLoader.js';
 import { registerCriticalSlashCommands } from './services/criticalSlashRegistration.js';
+import { runSafeTask } from './utils/errorHandler.js';
 import pkg from '../package.json' with { type: 'json' };
 import { EXPECTED_SCHEMA_VERSION, EXPECTED_SCHEMA_LABEL } from './config/database/schemaVersion.js';
 
@@ -151,7 +152,7 @@ class TitanBot extends Client {
     if (this.user?.id !== clientId) throw new Error(`CLIENT_ID mismatch: configured ${clientId}, logged-in bot is ${this.user?.id}.`);
 
     try {
-      const registered = await registerSlashCommands(this, { clientId, guildId });
+      await registerSlashCommands(this, { clientId, guildId });
       startupLog(`Registered ${this.commands.size} standard guild slash commands.`);
       const critical = await registerCriticalSlashCommands(this, { clientId, guildId });
       startupLog(`Verified critical slash commands: ${critical.join(', ')}`);
