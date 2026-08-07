@@ -9,7 +9,17 @@ const __dirname = dirname(__filename);
 
 export default async function loadEvents(client) {
     const eventsPath = join(__dirname, '../../events');
-    const eventFiles = await readdir(eventsPath).then(files => files.filter(file => file.endsWith('.js')));
+    const eventFiles = await readdir(eventsPath).then(files =>
+        files
+            .filter(file => file.endsWith('.js'))
+            .sort((a, b) => {
+                // 00_interactionAck.js must be registered before the main
+                // interaction handler so slash commands are acknowledged first.
+                if (a === '00_interactionAck.js') return -1;
+                if (b === '00_interactionAck.js') return 1;
+                return a.localeCompare(b);
+            })
+    );
 
     logger.info(`Found ${eventFiles.length} event files to load`);
 
