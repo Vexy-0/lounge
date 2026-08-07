@@ -9,6 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const MAX_COMMANDS = 100;
 const COMMAND_COUNT_WARN_THRESHOLD = 90;
+const PRIORITY_COMMANDS = ['help', 'sticky', 'stickyremove', 'automod'];
 
 function getSubcommandInfo(commandData) {
     const subcommands = [];
@@ -125,10 +126,25 @@ function prepareCommandsForRegistration(commands) {
     if (commands.length >= COMMAND_COUNT_WARN_THRESHOLD) {
         logger.warn(`Command count (${commands.length}) is near Discord's ${MAX_COMMANDS} command limit.`);
     }
-    if (commands.length > MAX_COMMANDS) {
-        throw new Error(`Loaded ${commands.length} top-level commands, exceeding Discord's ${MAX_COMMANDS} command limit. Reduce the command count instead of silently dropping commands.`);
-    }
-    return commands;
+
+    if (commands.length <= MAX_COMMANDS) return commands;
+
+    // Discord permits at most 100 top-level application commands per guild.
+    // Keep the bot online and guarantee the important commands are present
+    // instead of crashing startup when the project contains more than 100.
+    const byName = new Map(commands.map(command => [command.name, command]));
+    const priority = PRIORITY_COMMANDS
+        .map(name => byName.get(name))
+        .filter(Boolean);
+    const priorityNames = new Set(priority.map(command => command.name));
+    const remaining = commands.filter(command => !priorityNames.has(command.name));
+    const selected = [...priority, ...remaining].slice(0, MAX_COMMANDS);
+    const skipped = commands.filter(command => !selected.some(item => item.name === command.name));
+
+    logger.error(`Discord allows ${MAX_COMMANDS} top-level slash commands, but ${commands.length} were loaded.`);
+    logger.warn(`Registered ${selected.length} commands and skipped ${skipped.length}: ${skipped.map(command => command.name).join(', ')}`);
+    logger.warn(`Priority commands guaranteed: ${PRIORITY_COMMANDS.join(', ')}`);
+    return selected;
 }
 
 async function putCommands(client, route, commands, scopeLabel) {
