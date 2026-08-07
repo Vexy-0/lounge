@@ -3,7 +3,6 @@ import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { Collection } from 'discord.js';
 import { logger } from '../../utils/logger.js';
-import botConfig from '../../config/bot.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -105,12 +104,8 @@ function collectCommandPayloads(client) {
 function validateCommands(commands) {
     const validationErrors = [];
     for (const cmd of commands) {
-        if (!cmd.name || !/^[a-z0-9_-]{1,32}$/.test(cmd.name)) {
-            validationErrors.push(`Invalid command name: ${cmd.name}`);
-        }
-        if (cmd.description && cmd.description.length > 100) {
-            validationErrors.push(`Command ${cmd.name} has a description longer than Discord's 100-character limit.`);
-        }
+        if (!cmd.name || !/^[a-z0-9_-]{1,32}$/.test(cmd.name)) validationErrors.push(`Invalid command name: ${cmd.name}`);
+        if (cmd.description && cmd.description.length > 100) validationErrors.push(`Command ${cmd.name} has a description longer than Discord's 100-character limit.`);
         for (const option of cmd.options || []) {
             if (option.name && option.name.length > 32) validationErrors.push(`Command ${cmd.name} option ${option.name} has a name longer than 32 characters.`);
             if (option.description && option.description.length > 100) validationErrors.push(`Command ${cmd.name} option ${option.name} has a description longer than 100 characters.`);
@@ -123,19 +118,11 @@ function validateCommands(commands) {
 }
 
 function prepareCommandsForRegistration(commands) {
-    if (commands.length >= COMMAND_COUNT_WARN_THRESHOLD) {
-        logger.warn(`Command count (${commands.length}) is near Discord's ${MAX_COMMANDS} command limit.`);
-    }
-
+    if (commands.length >= COMMAND_COUNT_WARN_THRESHOLD) logger.warn(`Command count (${commands.length}) is near Discord's ${MAX_COMMANDS} command limit.`);
     if (commands.length <= MAX_COMMANDS) return commands;
 
-    // Discord permits at most 100 top-level application commands per guild.
-    // Keep the bot online and guarantee the important commands are present
-    // instead of crashing startup when the project contains more than 100.
     const byName = new Map(commands.map(command => [command.name, command]));
-    const priority = PRIORITY_COMMANDS
-        .map(name => byName.get(name))
-        .filter(Boolean);
+    const priority = PRIORITY_COMMANDS.map(name => byName.get(name)).filter(Boolean);
     const priorityNames = new Set(priority.map(command => command.name));
     const remaining = commands.filter(command => !priorityNames.has(command.name));
     const selected = [...priority, ...remaining].slice(0, MAX_COMMANDS);
@@ -165,10 +152,7 @@ async function registerCommandsInternal(client, clientId, guildId, commands, tot
     if (guildId) {
         await putCommands(client, `/applications/${clientId}/guilds/${guildId}/commands`, commandsToRegister, `guild (${guildId})`);
         logger.info('Guild slash commands are available immediately after Discord accepts the registration.');
-
-        if (process.env.REGISTER_GLOBAL_COMMANDS === 'true') {
-            await putCommands(client, `/applications/${clientId}/commands`, commandsToRegister, 'global');
-        }
+        if (process.env.REGISTER_GLOBAL_COMMANDS === 'true') await putCommands(client, `/applications/${clientId}/commands`, commandsToRegister, 'global');
         return;
     }
 
