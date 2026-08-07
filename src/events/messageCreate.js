@@ -12,6 +12,7 @@ import { getCommandPrefix, getBotMessage, isBotOwner, isCommandCategoryEnabled, 
 import { enforceAbuseProtection, formatCooldownDuration } from '../utils/abuseProtection.js';
 import { createEmbed } from '../utils/embeds.js';
 import { isCommandEnabled } from '../services/commandAccessService.js';
+import { refreshSticky } from '../services/stickyMessageService.js';
 import {
   getCountingGameConfig,
   saveCountingGameConfig,
@@ -36,13 +37,30 @@ export default {
       }
 
       await handlePrefixCommand(message, client);
-
+      await handleSticky(message, client);
       await handleLeveling(message, client);
     } catch (error) {
       logger.error('Error in messageCreate event:', error);
     }
   }
 };
+
+async function handleSticky(message, client) {
+  try {
+    const guildConfig = await getGuildConfig(client, message.guild.id);
+    const prefix = guildConfig?.prefix || getCommandPrefix();
+    const parsed = parsePrefixCommand(message.content, prefix);
+
+    if (parsed) {
+      const commandName = resolveCommandAlias(parsed.commandName).toLowerCase();
+      if (commandName === 'sticky' || commandName === 'stickyremove') return;
+    }
+
+    await refreshSticky(client, message);
+  } catch (error) {
+    logger.error('Error handling sticky message:', error);
+  }
+}
 
 async function handlePrefixCommand(message, client) {
   try {
