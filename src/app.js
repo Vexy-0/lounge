@@ -7,9 +7,11 @@ const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
 const PREFIX = (process.env.PREFIX || '!').trim() || '!';
 if (!TOKEN) throw new Error('Missing DISCORD_TOKEN/TOKEN in Railway variables.');
 
+// Keep the gateway intents minimal. MessageContent is required for !prefix commands.
+// GuildMembers is intentionally NOT requested because it is a privileged intent and
+// should not be able to take the whole bot offline if it is disabled in the Portal.
 const client = new Client({ intents: [
   GatewayIntentBits.Guilds,
-  GatewayIntentBits.GuildMembers,
   GatewayIntentBits.GuildMessages,
   GatewayIntentBits.GuildVoiceStates,
   GatewayIntentBits.MessageContent,
@@ -76,7 +78,7 @@ const urls = text => text.match(/https?:\/\/[^\s<>]+/gi) || [];
 const invite = text => /(?:discord\.gg|discord(?:app)?\.com\/invite)\/[^\s<>]+/i.test(text);
 function gifUrl(value) { try { const u = new URL(value), h = u.hostname.toLowerCase(); const hosts = ['giphy.com','media.giphy.com','tenor.com','media.tenor.com','klipy.com','klipy.co','redgifs.com','gfycat.com','imgur.com','i.imgur.com','cdn.discordapp.com','media.discordapp.net']; return hosts.some(x => h === x || h.endsWith(`.${x}`)) || /\.gif(?:$|[?#])/i.test(u.pathname + u.search); } catch { return false; } }
 function gifOnly(message, c) { return c.gifOnlyUsers.includes(message.author.id) || Boolean(message.member?.roles.cache.some(r => c.gifOnlyRoles.includes(r.id))); }
-function gifMessage(message) { const a = [...message.attachments.values()]; if (a.length && !a.every(x => (x.contentType || '').toLowerCase() === 'image/gif' || /\.gif(?:$|[?#])/i.test(x.name || '') || gifUrl(x.url))) return false; const u = urls(message.content); return a.length ? (!u.length || u.every(gifUrl)) : (u.length > 0 && u.every(gifUrl)); }
+function gifMessage(message) { const a = [...message.attachments.values()]; if (a.length && !a.every(x => (x.contentType || '').toLowerCase() === 'image/gif' || /\.gif(?:$|[?#])/i.test(x.name || '') || gifUrl(x.url))) return false; const u = urls(message.content); if (a.length) return !u.length || u.every(gifUrl); const embeds = [...message.embeds]; if (embeds.length) { const media = embeds.map(e => e.image?.url || e.thumbnail?.url).filter(Boolean); if (media.length && media.every(gifUrl)) return true; } return u.length > 0 && u.every(gifUrl); }
 function exempt(message, c) { return message.member?.permissions.has(PermissionFlagsBits.Administrator) || c.exemptChannels.includes(message.channelId) || Boolean(message.member?.roles.cache.some(r => c.exemptRoles.includes(r.id))); }
 async function log(guild, type, text) { const id = cfg(guild.id).logging[type], ch = id && guild.channels.cache.get(id); if (ch?.isTextBased()) await ch.send({ content: text, allowedMentions: { parse: [] } }).catch(() => {}); }
 async function punish(message, reason) { await message.delete().catch(() => {}); await log(message.guild, 'moderation', `🚨 AutoMod: ${reason}\nUser: <@${message.author.id}>\nChannel: <#${message.channelId}>`); }
@@ -87,7 +89,6 @@ async function setupLogs(guild) {
   c.logging = out; save(); return out;
 }
 const status = () => `🟢 **Lounge Online**\n🏓 Ping: **${client.ws.ping}ms**\n⏱️ Uptime: **${Math.floor((Date.now()-started)/1000)}s**\n🏠 Servers: **${client.guilds.cache.size}**`;
-
 async function register(guild) { try { await guild.commands.set(commands); console.log(`[Lounge] Registered ${commands.length} commands in ${guild.name} (${guild.id}).`); } catch (e) { console.error(`[Lounge] Command registration ${guild.id}:`, e); } }
 async function clearGlobals() { try { const old = await client.application.commands.fetch(); await client.application.commands.set([]); console.log(`[Lounge] Cleared ${old.size} global commands.`); } catch (e) { console.error('[Lounge] Global command cleanup:', e); } }
 
@@ -106,7 +107,7 @@ async function slash(i) {
     if (sub === 'status') return i.editReply(`🛡️ AutoMod **${c.automod?'ON':'OFF'}**\n🔗 Links **${c.links?'BLOCKED':'ALLOWED'}** · Invites **${c.invites?'BLOCKED':'ALLOWED'}**\n🔠 CAPS **${c.caps?'ON':'OFF'}** · Spam **${c.spam?'ON':'OFF'}**\n🎞️ GIF roles **${c.gifOnlyRoles.length}** · users **${c.gifOnlyUsers.length}**\n🚫 Words **${c.badWords.length}**`);
     if (sub === 'on' || sub === 'off') { c.automod = sub === 'on'; save(); return i.editReply(`🛡️ AutoMod **${c.automod?'ON':'OFF'}**.`); }
     if (['links','invites','caps','spam'].includes(sub)) { c[sub] = i.options.getBoolean('enabled', true); save(); return i.editReply(`✅ ${sub} **${c[sub]?'ON':'OFF'}**.`); }
-    if (sub === 'words') { const a=i.options.getString('action',true), w=i.options.getString('word',true).trim().toLowerCase(); if(a==='add'&&!c.badWords.includes(w))c.badWords.push(w); if(a==='remove')c.badWords=c.badWords.filter(x=>x!==w); save(); return i.editReply(`✅ Word **${w}** ${a}ed.`); }
+    if (sub === 'words') { const a=i.options.getString('action',true), w=i.options.getString('word',true).trim().toLowerCase(); if(a==='add'&&!c.badWords.includes(w))c.badWords.push(w); if(a==='remove')c.badWords=c.badWords.filter(x=>x!==w); save(); return i.editReply(`✅ Word **${w}** updated.`); }
     if (sub === 'gifonly') { const t=i.options.getMentionable('target',true), a=i.options.getString('action',true), list=t.user?c.gifOnlyUsers:c.gifOnlyRoles; if(a==='add'&&!list.includes(t.id))list.push(t.id); if(a==='remove'){const n=list.indexOf(t.id);if(n>=0)list.splice(n,1);} save(); return i.editReply(`🎞️ GIF-only **${a}** for <@${t.id}>.`); }
   }
   if (i.commandName === 'logging') { if (i.options.getSubcommand() === 'status') return i.editReply(`📋 Logging **${Object.keys(cfg(i.guildId).logging).length?'SET UP':'NOT SET UP'}**.`); await setupLogs(i.guild); return i.editReply('✅ All Lounge log channels are ready.'); }
