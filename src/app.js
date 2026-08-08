@@ -5,7 +5,6 @@ import {
   ActivityType,
   ChannelType,
   Client,
-  Collection,
   EmbedBuilder,
   GatewayIntentBits,
   PermissionFlagsBits,
@@ -26,225 +25,168 @@ const client = new Client({ intents: [
   GatewayIntentBits.Guilds,
   GatewayIntentBits.GuildMembers,
   GatewayIntentBits.GuildMessages,
-  GatewayIntentBits.GuildModeration,
   GatewayIntentBits.GuildVoiceStates,
   GatewayIntentBits.MessageContent,
 ] });
-client.commands = new Collection();
 const startedAt = Date.now();
 const stickies = new Map();
 const stickyLocks = new Set();
 const automod = new Map();
 const gifOnly = new Map();
 const spamTracker = new Map();
-const gifCache = new Map();
 const logging = new Map();
-
 const DATA_DIR = path.join(process.cwd(), 'data');
 const LOG_FILE = path.join(DATA_DIR, 'logging.json');
+
 function loadLogging() {
   try {
     const raw = JSON.parse(fs.readFileSync(LOG_FILE, 'utf8'));
-    for (const [guildId, value] of Object.entries(raw)) logging.set(guildId, value);
+    for (const [id, value] of Object.entries(raw)) logging.set(id, value);
   } catch {}
 }
 function saveLogging() {
   try {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(LOG_FILE, JSON.stringify(Object.fromEntries(logging), null, 2));
-  } catch (error) { console.error('[logging] save failed:', error.message); }
+  } catch (error) { console.error('[logging] save failed:', error); }
 }
 loadLogging();
 
-const DEFAULT_AUTOMOD = () => ({
-  enabled: true, links: true, invites: true, caps: false, capsPercent: 80, capsMinLength: 12,
-  mentionSpam: true, mentionLimit: 6, duplicate: true, duplicateCount: 3,
-  spam: true, spamCount: 5, spamWindowMs: 7000, words: new Set(), exemptRoles: new Set(), exemptChannels: new Set(),
-});
-function getConfig(guildId) { if (!automod.has(guildId)) automod.set(guildId, DEFAULT_AUTOMOD()); return automod.get(guildId); }
-function getGifBypass(guildId) { if (!gifOnly.has(guildId)) gifOnly.set(guildId, { roles: new Set(), users: new Set() }); return gifOnly.get(guildId); }
-function isExempt(message, config) {
-  if (message.member?.permissions?.has(PermissionFlagsBits.Administrator)) return true;
-  if (config.exemptChannels.has(message.channel.id)) return true;
-  return message.member?.roles?.cache?.some(role => config.exemptRoles.has(role.id)) === true;
-}
-function isGifOnlyMember(message) {
-  const bypass = getGifBypass(message.guild.id);
-  return bypass.users.has(message.author.id) || message.member?.roles?.cache?.some(role => bypass.roles.has(role.id)) === true;
-}
+const defaultAutoMod = () => ({ enabled: true, links: true, invites: true, words: new Set(), mentionSpam: true, mentionLimit: 6, spam: true, spamCount: 5, spamWindow: 7000 });
+const getAutoMod = id => { if (!automod.has(id)) automod.set(id, defaultAutoMod()); return automod.get(id); };
+const getGifOnly = id => { if (!gifOnly.has(id)) gifOnly.set(id, { roles: new Set(), users: new Set() }); return gifOnly.get(id); };
 
-const GIF_PAGE_HOSTS = new Set([
-  'giphy.com', 'media.giphy.com', 'i.giphy.com', 'tenor.com', 'media.tenor.com', 'c.tenor.com', 'media1.tenor.com',
-  'klipy.com', 'media.klipy.com', 'klipy.co', 'redgifs.com', 'media.redgifs.com', 'gfycat.com', 'giant.gfycat.com',
-]);
-const DIRECT_GIF_HOSTS = new Set(['cdn.discordapp.com', 'media.discordapp.net', 'images-ext-1.discordapp.net', 'i.imgur.com', 'i.redd.it', 'preview.redd.it']);
+const GIF_HOSTS = ['giphy.com', 'tenor.com', 'klipy.com', 'klipy.co', 'redgifs.com', 'gfycat.com'];
+const GIF_CDN_HOSTS = ['cdn.discordapp.com', 'media.discordapp.net', 'images-ext-1.discordapp.net', 'media.tenor.com', 'c.tenor.com', 'media.giphy.com', 'i.giphy.com', 'media.klipy.com', 'i.imgur.com', 'i.redd.it', 'preview.redd.it'];
 const URL_RE = /(?:https?:\/\/|www\.)[^\s<>()]+/gi;
-const MARKDOWN_URL_RE = /\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi;
 const INVITE_RE = /(?:discord(?:app)?\.com\/invite|discord\.gg)\/[A-Za-z0-9-]+/i;
 function normalizeUrl(url) { return /^www\./i.test(url) ? `https://${url}` : url; }
-function hostOf(url) { try { return new URL(normalizeUrl(url)).hostname.toLowerCase().replace(/^www\./, ''); } catch { return ''; } }
-function extractUrls(text = '') {
-  const urls = [];
-  for (const match of text.matchAll(URL_RE)) urls.push(match[0].replace(/[),.!?]+$/g, ''));
-  for (const match of text.matchAll(MARKDOWN_URL_RE)) urls.push(match[1]);
-  return [...new Set(urls)];
-}
-function knownGifHost(host) { return [...GIF_PAGE_HOSTS].some(value => host === value || host.endsWith(`.${value}`)); }
-function gifExtension(url) { try { const parsed = new URL(normalizeUrl(url)); return /\.gif(?:$|\/)/i.test(parsed.pathname) || /(?:^|[?&])(?:format|fm|ext)=gif(?:$|&)/i.test(parsed.search); } catch { return false; } }
-function directGifHost(url) { const host = hostOf(url); return [...DIRECT_GIF_HOSTS].some(value => host === value || host.endsWith(`.${value}`)); }
-async function isGifUrl(url) {
-  const normalized = normalizeUrl(url);
-  if (gifExtension(normalized) || knownGifHost(hostOf(normalized))) return true;
-  const cached = gifCache.get(normalized);
-  if (cached && cached.expires > Date.now()) return cached.value;
-  try {
-    const response = await fetch(normalized, { method: 'HEAD', redirect: 'follow', signal: AbortSignal.timeout(1800), headers: { 'User-Agent': 'Lounge-AutoMod/1.0' } });
-    const type = (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
-    const value = type === 'image/gif';
-    gifCache.set(normalized, { value, expires: Date.now() + 300000 });
-    return value;
-  } catch {
-    gifCache.set(normalized, { value: false, expires: Date.now() + 30000 });
-    return false;
-  }
-}
-function gifAttachment(file) {
-  const type = (file.contentType || '').split(';', 1)[0].toLowerCase();
-  return type === 'image/gif' || (file.name || '').toLowerCase().endsWith('.gif');
-}
+function host(url) { try { return new URL(normalizeUrl(url)).hostname.toLowerCase().replace(/^www\./, ''); } catch { return ''; } }
+function urls(text = '') { return [...new Set((text.match(URL_RE) || []).map(v => v.replace(/[),.!?]+$/g, '')))]; }
+function isKnownGif(url) { const h = host(url); return GIF_HOSTS.some(x => h === x || h.endsWith(`.${x}`)) || GIF_CDN_HOSTS.some(x => h === x || h.endsWith(`.${x}`)) || /\.gif(?:$|[?#])/i.test(url); }
+function isGifOnlyMember(message) { const b = getGifOnly(message.guild.id); return b.users.has(message.author.id) || message.member?.roles.cache.some(r => b.roles.has(r.id)); }
+function isExempt(message) { return message.member?.permissions.has(PermissionFlagsBits.Administrator); }
 
 async function punish(message, reason) {
   await message.delete().catch(() => {});
-  if (message.member?.moderatable) await message.member.timeout(60000, `Lounge AutoMod: ${reason}`).catch(() => {});
-  const warning = await message.channel.send({ content: `⚠️ <@${message.author.id}> message removed: **${reason}**`, allowedMentions: { users: [message.author.id] } }).catch(() => null);
-  if (warning) setTimeout(() => warning.delete().catch(() => {}), 5000).unref?.();
-  await logEvent(message.guild, 'moderation', 'AutoMod action', `**User:** <@${message.author.id}>\n**Channel:** <#${message.channel.id}>\n**Reason:** ${reason}\n**Content:** ${message.content?.slice(0, 900) || '[attachment only]'}`).catch(() => {});
-}
-async function checkGifOnly(message) {
-  if (!isGifOnlyMember(message)) return false; // CRITICAL: this rule applies ONLY to explicitly assigned users/roles.
-  const urls = extractUrls(message.content);
-  const attachments = [...message.attachments.values()];
-  if (INVITE_RE.test(message.content)) { await punish(message, 'GIF-only: Discord invites are not allowed'); return true; }
-  if (attachments.length) {
-    const attachmentsOk = attachments.every(gifAttachment);
-    const urlsOk = !urls.length || (await Promise.all(urls.map(isGifUrl))).every(Boolean);
-    if (attachmentsOk && urlsOk) return false;
-    await punish(message, 'GIF-only: only GIFs are allowed for this user/role'); return true;
-  }
-  if (!urls.length) { await punish(message, 'GIF-only: only GIFs are allowed for this user/role'); return true; }
-  const results = await Promise.all(urls.map(isGifUrl));
-  if (results.every(Boolean)) return false;
-  await punish(message, 'GIF-only: only GIFs are allowed for this user/role'); return true;
-}
-function tooManyCaps(content, config) { const letters = content.replace(/[^A-Za-z]/g, ''); if (letters.length < config.capsMinLength) return false; return letters ? (letters.replace(/[^A-Z]/g, '').length / letters.length) * 100 >= config.capsPercent : false; }
-function spamReason(message, config) {
-  const now = Date.now(); const key = `${message.guild.id}:${message.author.id}`;
-  const history = (spamTracker.get(key) || []).filter(item => now - item.time <= config.spamWindowMs);
-  history.push({ time: now, content: message.content.trim().toLowerCase() }); spamTracker.set(key, history.slice(-10));
-  if (config.spam && history.length >= config.spamCount) return 'message spam';
-  if (config.duplicate && history.filter(item => item.content === message.content.trim().toLowerCase()).length >= config.duplicateCount) return 'duplicate messages';
-  return null;
-}
-async function runAutoMod(message) {
-  if (!message.guild || message.author.bot || message.webhookId) return;
-  const config = getConfig(message.guild.id);
-  if (!config.enabled || isExempt(message, config)) return;
-  if (await checkGifOnly(message)) return;
-  const urls = extractUrls(message.content);
-  if (config.invites && INVITE_RE.test(message.content)) return punish(message, 'Discord invite links are not allowed');
-  // Normal members are NOT treated as GIF-only. When link blocking is enabled, ALL links are blocked,
-  // including GIF-provider links. Only explicitly assigned GIF-only users/roles may post GIF links.
-  if (config.links && urls.length) return punish(message, 'links are not allowed');
-  if (config.words.size) { const lowered = message.content.toLowerCase(); for (const word of config.words) if (lowered.includes(word.toLowerCase())) return punish(message, 'blocked word'); }
-  if (config.mentionSpam && message.mentions.users.size + message.mentions.roles.size >= config.mentionLimit) return punish(message, 'mention spam');
-  if (config.caps && tooManyCaps(message.content, config)) return punish(message, 'excessive caps');
-  const spam = spamReason(message, config); if (spam) await punish(message, spam);
+  if (message.member?.moderatable) await message.member.timeout(60_000, `Lounge AutoMod: ${reason}`).catch(() => {});
+  await message.channel.send({ content: `⚠️ <@${message.author.id}> message removed: **${reason}**`, allowedMentions: { users: [message.author.id] } }).then(m => setTimeout(() => m.delete().catch(() => {}), 5000)).catch(() => {});
+  await logEvent(message.guild, 'moderation', 'AutoMod action', `**User:** <@${message.author.id}>\n**Channel:** <#${message.channel.id}>\n**Reason:** ${reason}\n**Content:** ${(message.content || '[attachment]').slice(0, 900)}`, 0xed4245);
 }
 
-const LOG_TYPES = {
-  message: 'message-logs', moderation: 'moderation-logs', member: 'member-logs', voice: 'voice-logs', server: 'server-logs', role: 'role-logs',
-};
-const LOG_META = {
-  message: ['Message Logs', '📝'], moderation: ['Moderation Logs', '🛡️'], member: ['Member Logs', '👤'], voice: ['Voice Logs', '🔊'], server: ['Server Logs', '⚙️'], role: ['Role Logs', '🎭'],
-};
+function gifAttachment(file) { const type = (file.contentType || '').split(';')[0].toLowerCase(); return type === 'image/gif' || (file.name || '').toLowerCase().endsWith('.gif'); }
+async function gifOnlyCheck(message) {
+  if (!isGifOnlyMember(message)) return false;
+  if (INVITE_RE.test(message.content)) { await punish(message, 'GIF-only: invites are not allowed'); return true; }
+  const links = urls(message.content);
+  const files = [...message.attachments.values()];
+  if (files.length) {
+    if (!files.every(gifAttachment) || links.some(link => !isKnownGif(link))) { await punish(message, 'GIF-only: only GIFs are allowed'); return true; }
+    return false;
+  }
+  if (!links.length || links.some(link => !isKnownGif(link))) { await punish(message, 'GIF-only: only GIFs are allowed'); return true; }
+  return false;
+}
+
+async function runAutoMod(message) {
+  if (!message.guild || message.author.bot || message.webhookId) return;
+  const c = getAutoMod(message.guild.id);
+  if (!c.enabled || isExempt(message)) return;
+  if (await gifOnlyCheck(message)) return;
+  if (c.invites && INVITE_RE.test(message.content)) return punish(message, 'Discord invite links are not allowed');
+  if (c.links && urls(message.content).length) return punish(message, 'links are not allowed');
+  if (c.words.size) { const text = message.content.toLowerCase(); for (const word of c.words) if (text.includes(word)) return punish(message, 'blocked word'); }
+  if (c.mentionSpam && message.mentions.users.size + message.mentions.roles.size >= c.mentionLimit) return punish(message, 'mention spam');
+  if (c.spam) {
+    const key = `${message.guild.id}:${message.author.id}`;
+    const now = Date.now();
+    const history = (spamTracker.get(key) || []).filter(x => now - x.time <= c.spamWindow);
+    history.push({ time: now, text: message.content.trim().toLowerCase() });
+    spamTracker.set(key, history.slice(-10));
+    if (history.length >= c.spamCount) return punish(message, 'message spam');
+  }
+}
+
+const LOGS = { message: 'message-logs', moderation: 'moderation-logs', member: 'member-logs', voice: 'voice-logs', server: 'server-logs', role: 'role-logs' };
+const LOG_LABELS = { message: '📝 Message Logs', moderation: '🛡️ Moderation Logs', member: '👤 Member Logs', voice: '🔊 Voice Logs', server: '⚙️ Server Logs', role: '🎭 Role Logs' };
 async function logEvent(guild, type, title, description, color = 0x5865f2) {
-  if (!guild) return;
-  const config = logging.get(guild.id); const channelId = config?.channels?.[type]; if (!channelId) return;
-  const channel = guild.channels.cache.get(channelId); if (!channel?.isTextBased?.()) return;
-  const [label, emoji] = LOG_META[type] || ['Logs', '📋'];
-  const embed = new EmbedBuilder().setColor(color).setAuthor({ name: `${emoji} ${label}` }).setTitle(title).setDescription(description?.slice(0, 4000) || 'No details available.').setTimestamp();
-  await channel.send({ embeds: [embed] }).catch(() => {});
+  const id = logging.get(guild?.id)?.channels?.[type];
+  const channel = id ? guild.channels.cache.get(id) : null;
+  if (!channel?.isTextBased?.()) return;
+  await channel.send({ embeds: [new EmbedBuilder().setColor(color).setAuthor({ name: LOG_LABELS[type] || '📋 Logs' }).setTitle(title).setDescription(String(description || '').slice(0, 4000)).setTimestamp()] }).catch(() => {});
 }
 async function setupLogging(guild) {
-  if (!guild.members.me?.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error('I need Manage Channels to create the logging channels.');
-  let category = guild.channels.cache.find(channel => channel.type === ChannelType.GuildCategory && channel.name === 'Lounge Logs');
+  const me = guild.members.me;
+  if (!me?.permissions.has(PermissionFlagsBits.ManageChannels)) throw new Error('I need Manage Channels to create logging channels.');
+  let category = guild.channels.cache.find(c => c.type === ChannelType.GuildCategory && c.name === 'Lounge Logs');
   if (!category) category = await guild.channels.create({ name: 'Lounge Logs', type: ChannelType.GuildCategory, reason: 'Lounge logging setup' });
   const channels = {};
-  for (const [type, name] of Object.entries(LOG_TYPES)) {
-    let channel = guild.channels.cache.find(item => item.parentId === category.id && item.name === name && item.type === ChannelType.GuildText);
+  for (const [type, name] of Object.entries(LOGS)) {
+    let channel = guild.channels.cache.find(c => c.parentId === category.id && c.type === ChannelType.GuildText && c.name === name);
     if (!channel) channel = await guild.channels.create({ name, type: ChannelType.GuildText, parent: category.id, reason: 'Lounge logging setup' });
     channels[type] = channel.id;
   }
-  logging.set(guild.id, { categoryId: category.id, channels }); saveLogging();
+  logging.set(guild.id, { categoryId: category.id, channels });
+  saveLogging();
   return category;
 }
 
+function statusEmbed() { return new EmbedBuilder().setTitle('Lounge Status').setDescription('🟢 Online').addFields({ name: 'Latency', value: `${client.ws.ping}ms`, inline: true }, { name: 'Uptime', value: `${Math.floor((Date.now() - startedAt) / 1000)}s`, inline: true }, { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true }); }
+function helpEmbed() { return new EmbedBuilder().setTitle('Lounge Commands').setDescription(`**General**\n\`/ping\` · \`/status\` · \`/help\`\n\n**Sticky**\n\`/sticky\` · \`/stickyremove\`\n\n**AutoMod**\n\`/automod status\` · \`/automod on\` · \`/automod off\`\n\`/automod links\` · \`/automod invites\` · \`/automod word\` · \`/automod gifonly\`\n\n**Logging**\n\`/logging setup\` · \`/logging status\`\n\n**Prefix**\n\`${PREFIX}ping\` · \`${PREFIX}status\` · \`${PREFIX}help\` · \`${PREFIX}sticky <message>\` · \`${PREFIX}stickyremove\` · \`${PREFIX}automod ...\` · \`${PREFIX}logging setup\``); }
+
 const commands = [
-  { data: new SlashCommandBuilder().setName('ping').setDescription('Check bot latency.'), execute: async i => i.reply(`🏓 Pong! ${client.ws.ping}ms`) },
-  { data: new SlashCommandBuilder().setName('status').setDescription('Show bot status.'), execute: async i => i.reply({ embeds: [new EmbedBuilder().setTitle('Lounge Status').setDescription('🟢 Online').addFields({ name: 'Latency', value: `${client.ws.ping}ms`, inline: true }, { name: 'Uptime', value: `${Math.floor((Date.now() - startedAt) / 1000)}s`, inline: true }, { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true })] }) },
-  { data: new SlashCommandBuilder().setName('help').setDescription('Show Lounge commands.'), execute: async i => i.reply({ embeds: [new EmbedBuilder().setTitle('Lounge Commands').setDescription(`**General**\n\`/ping\` · \`/status\` · \`/help\`\n\n**Sticky**\n\`/sticky\` · \`/stickyremove\`\n\n**AutoMod**\n\`/automod status\` · \`/automod on\` · \`/automod off\`\n\`/automod links\` · \`/automod invites\` · \`/automod word\`\n\`/automod exempt\` · \`/automod gifonly\`\n\n**Logging**\n\`/logging setup\` · \`/logging status\`\n\n**Prefix**\n\`${PREFIX}ping\` · \`${PREFIX}status\` · \`${PREFIX}help\` · \`${PREFIX}sticky <message>\` · \`${PREFIX}stickyremove\` · \`${PREFIX}automod ...\` · \`${PREFIX}logging setup\``)] }) },
-  { data: new SlashCommandBuilder().setName('sticky').setDescription('Create or update a sticky message.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()).addStringOption(o => o.setName('message').setDescription('Sticky content.').setRequired(true).setMaxLength(2000)), execute: async i => { const content = i.options.getString('message', true); const existing = stickies.get(i.channelId); if (existing?.messageId) await i.channel.messages.delete(existing.messageId).catch(() => {}); const sent = await i.channel.send({ content, allowedMentions: { parse: [] } }); stickies.set(i.channelId, { messageId: sent.id, content }); await i.reply('📌 Sticky message set.'); } },
-  { data: new SlashCommandBuilder().setName('stickyremove').setDescription('Remove the sticky message.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()), execute: async i => { const existing = stickies.get(i.channelId); if (!existing) return i.reply('There is no sticky message in this channel.'); await i.channel.messages.delete(existing.messageId).catch(() => {}); stickies.delete(i.channelId); await i.reply('🗑️ Sticky message removed.'); } },
-  { data: new SlashCommandBuilder().setName('automod').setDescription('Configure Lounge AutoMod.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString())
-    .addSubcommand(s => s.setName('status').setDescription('View AutoMod settings.'))
+  { data: new SlashCommandBuilder().setName('ping').setDescription('Check bot latency.'), execute: i => i.reply(`🏓 Pong! ${client.ws.ping}ms`) },
+  { data: new SlashCommandBuilder().setName('status').setDescription('Show bot status.'), execute: i => i.reply({ embeds: [statusEmbed()] }) },
+  { data: new SlashCommandBuilder().setName('help').setDescription('Show Lounge commands.'), execute: i => i.reply({ embeds: [helpEmbed()] }) },
+  { data: new SlashCommandBuilder().setName('sticky').setDescription('Create or update a sticky message.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()).addStringOption(o => o.setName('message').setDescription('Sticky content.').setRequired(true).setMaxLength(2000)), execute: async i => { const content = i.options.getString('message', true); if (stickies.get(i.channelId)?.messageId) await i.channel.messages.delete(stickies.get(i.channelId).messageId).catch(() => {}); const sent = await i.channel.send({ content, allowedMentions: { parse: [] } }); stickies.set(i.channelId, { messageId: sent.id, content }); await i.reply('📌 Sticky message set.'); } },
+  { data: new SlashCommandBuilder().setName('stickyremove').setDescription('Remove the sticky message.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()), execute: async i => { const old = stickies.get(i.channelId); if (!old) return i.reply('There is no sticky message here.'); await i.channel.messages.delete(old.messageId).catch(() => {}); stickies.delete(i.channelId); await i.reply('🗑️ Sticky removed.'); } },
+  { data: new SlashCommandBuilder().setName('automod').setDescription('Configure AutoMod.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString())
+    .addSubcommand(s => s.setName('status').setDescription('Show AutoMod status.'))
     .addSubcommand(s => s.setName('on').setDescription('Enable AutoMod.'))
     .addSubcommand(s => s.setName('off').setDescription('Disable AutoMod.'))
-    .addSubcommand(s => s.setName('links').setDescription('Allow or block all links.').addBooleanOption(o => o.setName('enabled').setDescription('Block links?').setRequired(true)))
-    .addSubcommand(s => s.setName('invites').setDescription('Allow or block Discord invites.').addBooleanOption(o => o.setName('enabled').setDescription('Block invites?').setRequired(true)))
-    .addSubcommand(s => s.setName('word').setDescription('Add or remove a blocked word.').addStringOption(o => o.setName('action').setDescription('Action').setRequired(true).addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' })).addStringOption(o => o.setName('word').setDescription('Word or phrase').setRequired(true).setMaxLength(100)))
-    .addSubcommand(s => s.setName('exempt').setDescription('Exempt a role or channel.').addStringOption(o => o.setName('action').setDescription('Action').setRequired(true).addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' })).addStringOption(o => o.setName('target').setDescription('Role or channel ID/mention').setRequired(true)))
-    .addSubcommand(s => s.setName('gifonly').setDescription('Allow only GIFs for a specific role or user.').addStringOption(o => o.setName('action').setDescription('Action').setRequired(true).addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' })).addStringOption(o => o.setName('target').setDescription('Role or user ID/mention').setRequired(true))), execute: async i => {
-      const c = getConfig(i.guildId); const sub = i.options.getSubcommand();
-      if (sub === 'status') return i.reply({ embeds: [new EmbedBuilder().setTitle('Lounge AutoMod').setDescription(`**Status:** ${c.enabled ? '🟢 Enabled' : '🔴 Disabled'}\n**Links:** ${c.links ? 'Blocked' : 'Allowed'}\n**Invites:** ${c.invites ? 'Blocked' : 'Allowed'}\n**Blocked words:** ${c.words.size}\n**GIF-only roles:** ${getGifBypass(i.guildId).roles.size}\n**GIF-only users:** ${getGifBypass(i.guildId).users.size}`)] });
+    .addSubcommand(s => s.setName('links').setDescription('Block or allow links.').addBooleanOption(o => o.setName('enabled').setDescription('Block links?').setRequired(true)))
+    .addSubcommand(s => s.setName('invites').setDescription('Block or allow Discord invites.').addBooleanOption(o => o.setName('enabled').setDescription('Block invites?').setRequired(true)))
+    .addSubcommand(s => s.setName('word').setDescription('Add/remove a blocked word.').addStringOption(o => o.setName('action').setDescription('Action.').setRequired(true).addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' })).addStringOption(o => o.setName('word').setDescription('Word.').setRequired(true).setMaxLength(100)))
+    .addSubcommand(s => s.setName('gifonly').setDescription('Allow GIFs only for a role or user.').addStringOption(o => o.setName('action').setDescription('Action.').setRequired(true).addChoices({ name: 'add', value: 'add' }, { name: 'remove', value: 'remove' })).addStringOption(o => o.setName('target').setDescription('Role/user mention or ID.').setRequired(true))), execute: async i => {
+      const c = getAutoMod(i.guildId); const sub = i.options.getSubcommand();
+      if (sub === 'status') return i.reply(`AutoMod: ${c.enabled ? 'ON' : 'OFF'} | Links: ${c.links ? 'BLOCKED' : 'ALLOWED'} | Invites: ${c.invites ? 'BLOCKED' : 'ALLOWED'} | GIF-only roles: ${getGifOnly(i.guildId).roles.size} | users: ${getGifOnly(i.guildId).users.size}`);
       if (sub === 'on' || sub === 'off') { c.enabled = sub === 'on'; return i.reply(`AutoMod ${c.enabled ? 'enabled' : 'disabled'}.`); }
       if (sub === 'links' || sub === 'invites') { c[sub] = i.options.getBoolean('enabled', true); return i.reply(`${sub} are now ${c[sub] ? 'blocked' : 'allowed'}.`); }
       if (sub === 'word') { const action = i.options.getString('action', true); const word = i.options.getString('word', true).toLowerCase(); action === 'add' ? c.words.add(word) : c.words.delete(word); return i.reply(`Blocked word ${action === 'add' ? 'added' : 'removed'}: \`${word}\``); }
-      if (sub === 'exempt') { const action = i.options.getString('action', true); const target = i.options.getString('target', true).replace(/[<@#&>]/g, ''); const memberRole = i.guild.roles.cache.get(target); const channel = i.guild.channels.cache.get(target); if (memberRole) action === 'add' ? c.exemptRoles.add(target) : c.exemptRoles.delete(target); else if (channel) action === 'add' ? c.exemptChannels.add(target) : c.exemptChannels.delete(target); else return i.reply('Could not find that role or channel.'); return i.reply(`AutoMod exemption ${action === 'add' ? 'added' : 'removed'}.`); }
-      if (sub === 'gifonly') { const action = i.options.getString('action', true); const raw = i.options.getString('target', true); const target = raw.replace(/[<@!&>]/g, ''); const bypass = getGifBypass(i.guildId); const role = i.guild.roles.cache.get(target); const user = i.guild.members.cache.get(target); if (role) action === 'add' ? bypass.roles.add(target) : bypass.roles.delete(target); else if (user) action === 'add' ? bypass.users.add(target) : bypass.users.delete(target); else return i.reply('Could not find that role or member.'); return i.reply(`GIF-only ${action === 'add' ? 'enabled for' : 'removed from'} ${role ? `<@&${target}>` : `<@${target}>`}.`); }
+      const action = i.options.getString('action', true); const raw = i.options.getString('target', true); const id = raw.replace(/[<@!&>]/g, ''); const b = getGifOnly(i.guildId); const role = i.guild.roles.cache.get(id); const member = i.guild.members.cache.get(id); if (!role && !member) return i.reply('Could not find that role/member.'); if (action === 'add') role ? b.roles.add(id) : b.users.add(id); else role ? b.roles.delete(id) : b.users.delete(id); return i.reply(`GIF-only ${action === 'add' ? 'enabled for' : 'removed from'} ${role ? `<@&${id}>` : `<@${id}>`}.`);
     } },
-  { data: new SlashCommandBuilder().setName('logging').setDescription('Configure server logging.').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString()).addSubcommand(s => s.setName('setup').setDescription('Create all Lounge logging channels.')).addSubcommand(s => s.setName('status').setDescription('Show logging channels.')), execute: async i => { const sub = i.options.getSubcommand(); if (sub === 'setup') { const category = await setupLogging(i.guild); return i.reply(`✅ Logging is ready in ${category}.\nCreated/verified: message, moderation, member, voice, server and role logs.`); } const config = logging.get(i.guildId); if (!config) return i.reply('Logging is not configured. Use `/logging setup` first.'); return i.reply(`📋 Logging is active in <#${config.channels.message}> and 5 other log channels.`); } },
+  { data: new SlashCommandBuilder().setName('logging').setDescription('Configure server logs.').setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild.toString()).addSubcommand(s => s.setName('setup').setDescription('Create all log channels.')).addSubcommand(s => s.setName('status').setDescription('Show logging status.')), execute: async i => { const sub = i.options.getSubcommand(); if (sub === 'setup') { const category = await setupLogging(i.guild); return i.reply(`✅ Logging is ready in ${category}.`); } const c = logging.get(i.guildId); return i.reply(c ? '📋 Logging is configured.' : 'Logging is not configured. Use `/logging setup`.'); } },
 ];
 
-for (const command of commands) client.commands.set(command.data.name, command);
+const commandMap = new Map(commands.map(c => [c.data.name, c]));
 
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  const body = commands.map(command => command.data.toJSON());
+  const body = commands.map(c => c.data.toJSON());
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
   await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [] });
-  console.log(`[commands] registered ${body.length} guild commands and cleared global commands`);
+  console.log(`[commands] registered ${body.length} guild commands; global commands cleared`);
 }
 
-async function handlePrefix(message) {
-  if (!message.content.startsWith(PREFIX) || message.author.bot) return false;
-  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
-  const name = (args.shift() || '').toLowerCase();
+async function prefix(message) {
+  if (message.author.bot || !message.content.startsWith(PREFIX)) return false;
+  const parts = message.content.slice(PREFIX.length).trim().split(/\s+/); const name = (parts.shift() || '').toLowerCase();
   if (!name) return true;
-  if (name === 'ping') return void message.reply(`🏓 Pong! ${client.ws.ping}ms`);
-  if (name === 'status') return void message.reply({ embeds: [new EmbedBuilder().setTitle('Lounge Status').setDescription('🟢 Online').addFields({ name: 'Latency', value: `${client.ws.ping}ms`, inline: true }, { name: 'Uptime', value: `${Math.floor((Date.now() - startedAt) / 1000)}s`, inline: true }, { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true })] });
-  if (name === 'help') return void message.reply({ embeds: [new EmbedBuilder().setTitle('Lounge Commands').setDescription(`Use \`/help\` for the full command list.\nPrefix: \`${PREFIX}\``)] });
-  if (name === 'sticky') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) return void message.reply('❌ You need Manage Messages.'); const content = args.join(' ').trim(); if (!content) return void message.reply(`Usage: \`${PREFIX}sticky <message>\``); const old = stickies.get(message.channel.id); if (old?.messageId) await message.channel.messages.delete(old.messageId).catch(() => {}); const sent = await message.channel.send({ content: content.slice(0, 2000), allowedMentions: { parse: [] } }); stickies.set(message.channel.id, { messageId: sent.id, content }); return; }
-  if (name === 'stickyremove') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) return void message.reply('❌ You need Manage Messages.'); const old = stickies.get(message.channel.id); if (!old) return void message.reply('There is no sticky message in this channel.'); await message.channel.messages.delete(old.messageId).catch(() => {}); stickies.delete(message.channel.id); return void message.reply('🗑️ Sticky removed.'); }
-  if (name === 'automod') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) return void message.reply('❌ You need Manage Messages.'); const sub = (args.shift() || 'status').toLowerCase(); const c = getConfig(message.guild.id); if (sub === 'status') return void message.reply(`AutoMod: ${c.enabled ? 'ON' : 'OFF'} | Links: ${c.links ? 'BLOCKED' : 'ALLOWED'} | GIF-only roles: ${getGifBypass(message.guild.id).roles.size} | users: ${getGifBypass(message.guild.id).users.size}`); if (sub === 'on' || sub === 'off') { c.enabled = sub === 'on'; return void message.reply(`AutoMod ${c.enabled ? 'enabled' : 'disabled'}.`); } if (sub === 'links') { c.links = (args.shift() || '').toLowerCase() === 'on'; return void message.reply(`Links are now ${c.links ? 'blocked' : 'allowed'}.`); } if (sub === 'invites') { c.invites = (args.shift() || '').toLowerCase() === 'on'; return void message.reply(`Invites are now ${c.invites ? 'blocked' : 'allowed'}.`); } if (sub === 'gifonly') { const action = (args.shift() || '').toLowerCase(); const raw = args.shift(); const target = raw?.replace(/[<@!&>]/g, ''); const bypass = getGifBypass(message.guild.id); const role = target && message.guild.roles.cache.get(target); const user = target && message.guild.members.cache.get(target); if (!role && !user) return void message.reply(`Usage: \`${PREFIX}automod gifonly add|remove @role|@user\``); if (action === 'add') role ? bypass.roles.add(target) : bypass.users.add(target); else if (action === 'remove') role ? bypass.roles.delete(target) : bypass.users.delete(target); else return void message.reply(`Usage: \`${PREFIX}automod gifonly add|remove @role|@user\``); return void message.reply(`GIF-only ${action === 'add' ? 'enabled for' : 'removed from'} ${role ? `<@&${target}>` : `<@${target}>`}.`); } return void message.reply(`Unknown AutoMod option. Use \`${PREFIX}automod status\`.`); }
-  if (name === 'logging') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageGuild)) return void message.reply('❌ You need Manage Server.'); const sub = (args.shift() || 'status').toLowerCase(); if (sub === 'setup') { const category = await setupLogging(message.guild); return void message.reply(`✅ Logging setup complete in ${category}.`); } return void message.reply(logging.has(message.guild.id) ? '📋 Logging is enabled.' : `Logging is not configured. Use \`${PREFIX}logging setup\`.`); }
+  if (name === 'ping') { await message.reply(`🏓 Pong! ${client.ws.ping}ms`); return true; }
+  if (name === 'status') { await message.reply({ embeds: [statusEmbed()] }); return true; }
+  if (name === 'help') { await message.reply({ embeds: [helpEmbed()] }); return true; }
+  if (name === 'sticky') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) { await message.reply('❌ Manage Messages required.'); return true; } const content = parts.join(' ').slice(0, 2000); if (!content) { await message.reply(`Usage: ${PREFIX}sticky <message>`); return true; } const old = stickies.get(message.channel.id); if (old?.messageId) await message.channel.messages.delete(old.messageId).catch(() => {}); const sent = await message.channel.send({ content, allowedMentions: { parse: [] } }); stickies.set(message.channel.id, { messageId: sent.id, content }); return true; }
+  if (name === 'stickyremove') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) { await message.reply('❌ Manage Messages required.'); return true; } const old = stickies.get(message.channel.id); if (!old) { await message.reply('There is no sticky message here.'); return true; } await message.channel.messages.delete(old.messageId).catch(() => {}); stickies.delete(message.channel.id); await message.reply('🗑️ Sticky removed.'); return true; }
+  if (name === 'automod') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) { await message.reply('❌ Manage Messages required.'); return true; } const sub = (parts.shift() || 'status').toLowerCase(); const c = getAutoMod(message.guild.id); if (sub === 'status') { await message.reply(`AutoMod: ${c.enabled ? 'ON' : 'OFF'} | Links: ${c.links ? 'BLOCKED' : 'ALLOWED'} | GIF-only roles: ${getGifOnly(message.guild.id).roles.size} | users: ${getGifOnly(message.guild.id).users.size}`); return true; } if (sub === 'on' || sub === 'off') { c.enabled = sub === 'on'; await message.reply(`AutoMod ${c.enabled ? 'enabled' : 'disabled'}.`); return true; } if (sub === 'links' || sub === 'invites') { c[sub] = (parts.shift() || '').toLowerCase() === 'on'; await message.reply(`${sub} are now ${c[sub] ? 'blocked' : 'allowed'}.`); return true; } if (sub === 'gifonly') { const action = (parts.shift() || '').toLowerCase(); const raw = parts.shift(); const id = raw?.replace(/[<@!&>]/g, ''); const b = getGifOnly(message.guild.id); const role = id && message.guild.roles.cache.get(id); const member = id && message.guild.members.cache.get(id); if (!role && !member) { await message.reply(`Usage: ${PREFIX}automod gifonly add|remove @role|@user`); return true; } if (action === 'add') role ? b.roles.add(id) : b.users.add(id); else if (action === 'remove') role ? b.roles.delete(id) : b.users.delete(id); else { await message.reply(`Usage: ${PREFIX}automod gifonly add|remove @role|@user`); return true; } await message.reply(`GIF-only ${action === 'add' ? 'enabled for' : 'removed from'} ${role ? `<@&${id}>` : `<@${id}>`}.`); return true; } await message.reply(`Unknown AutoMod option. Use ${PREFIX}automod status.`); return true; }
+  if (name === 'logging') { if (!message.member?.permissions.has(PermissionFlagsBits.ManageGuild)) { await message.reply('❌ Manage Server required.'); return true; } const sub = (parts.shift() || 'status').toLowerCase(); if (sub === 'setup') { const category = await setupLogging(message.guild); await message.reply(`✅ Logging is ready in ${category}.`); } else await message.reply(logging.has(message.guild.id) ? '📋 Logging is configured.' : `Logging is not configured. Use ${PREFIX}logging setup.`); return true; }
   return false;
 }
 
 client.on('messageCreate', async message => {
   try {
-    if (await handlePrefix(message)) return;
-    await runAutoMod(message);
+    if (await prefix(message)) return;
     if (message.author.bot || !message.guild) return;
+    await runAutoMod(message);
     const sticky = stickies.get(message.channel.id);
     if (sticky && !stickyLocks.has(message.channel.id)) {
       stickyLocks.add(message.channel.id);
@@ -255,23 +197,22 @@ client.on('messageCreate', async message => {
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-  const command = client.commands.get(interaction.commandName);
-  if (!command) return interaction.reply({ content: 'This command is no longer available. Please wait a moment and try again.', ephemeral: true }).catch(() => {});
+  const command = commandMap.get(interaction.commandName);
+  if (!command) return interaction.reply({ content: 'This command is no longer available.', ephemeral: true }).catch(() => {});
   try { await command.execute(interaction); } catch (error) { console.error(`[command:${interaction.commandName}]`, error); const payload = { content: '❌ Something went wrong while running that command.', ephemeral: true }; if (interaction.replied || interaction.deferred) await interaction.followUp(payload).catch(() => {}); else await interaction.reply(payload).catch(() => {}); }
 });
 
-client.on('messageDelete', async message => { if (!message.guild || message.author?.bot) return; await logEvent(message.guild, 'message', 'Message deleted', `**Author:** ${message.author ? `<@${message.author.id}>` : 'Unknown'}\n**Channel:** <#${message.channel.id}>\n**Content:** ${message.content?.slice(0, 3000) || '[unavailable]'}`, 0xed4245); });
-client.on('messageUpdate', async (oldMessage, newMessage) => { if (!newMessage.guild || newMessage.author?.bot || oldMessage.content === newMessage.content) return; await logEvent(newMessage.guild, 'message', 'Message edited', `**Author:** <@${newMessage.author.id}>\n**Channel:** <#${newMessage.channel.id}>\n**Before:** ${oldMessage.content?.slice(0, 1500) || '[empty]'}\n**After:** ${newMessage.content?.slice(0, 1500) || '[empty]'}`, 0xfee75c); });
-client.on('guildMemberAdd', member => logEvent(member.guild, 'member', 'Member joined', `**Member:** <@${member.id}>\n**Account:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>`, 0x57f287));
-client.on('guildMemberRemove', member => logEvent(member.guild, 'member', 'Member left', `**Member:** ${member.user?.tag || member.id}\n**ID:** ${member.id}`, 0xed4245));
-client.on('voiceStateUpdate', (oldState, newState) => { if (oldState.channelId === newState.channelId) return; const channel = newState.channel || oldState.channel; return logEvent(newState.guild, 'voice', 'Voice state updated', `**Member:** <@${newState.id}>\n**From:** ${oldState.channelId ? `<#${oldState.channelId}>` : 'None'}\n**To:** ${newState.channelId ? `<#${newState.channelId}>` : 'None'}${channel ? `\n**Channel:** ${channel.name}` : ''}`); });
-client.on('roleCreate', role => logEvent(role.guild, 'role', 'Role created', `**Role:** <@&${role.id}>\n**Name:** ${role.name}\n**ID:** ${role.id}`, 0x57f287));
-client.on('roleDelete', role => logEvent(role.guild, 'role', 'Role deleted', `**Role:** ${role.name}\n**ID:** ${role.id}`, 0xed4245));
-client.on('roleUpdate', (oldRole, newRole) => logEvent(newRole.guild, 'role', 'Role updated', `**Role:** <@&${newRole.id}>\n**Before:** ${oldRole.name}\n**After:** ${newRole.name}`, 0xfee75c));
-client.on('channelCreate', channel => channel.guild && logEvent(channel.guild, 'server', 'Channel created', `**Channel:** <#${channel.id}>\n**Name:** ${channel.name}`));
-client.on('channelDelete', channel => channel.guild && logEvent(channel.guild, 'server', 'Channel deleted', `**Channel:** ${channel.name}\n**ID:** ${channel.id}`, 0xed4245));
-client.on('guildBanAdd', ban => logEvent(ban.guild, 'moderation', 'Member banned', `**User:** ${ban.user.tag}\n**ID:** ${ban.user.id}`, 0xed4245));
-client.on('guildBanRemove', ban => logEvent(ban.guild, 'moderation', 'Member unbanned', `**User:** ${ban.user.tag}\n**ID:** ${ban.user.id}`, 0x57f287));
+client.on('messageDelete', message => { if (message.guild && !message.author?.bot) logEvent(message.guild, 'message', 'Message deleted', `**Author:** ${message.author ? `<@${message.author.id}>` : 'Unknown'}\n**Channel:** <#${message.channel.id}>\n**Content:** ${(message.content || '[unavailable]').slice(0, 3000)}`, 0xed4245); });
+client.on('messageUpdate', (oldMessage, newMessage) => { if (newMessage.guild && !newMessage.author?.bot && oldMessage.content !== newMessage.content) logEvent(newMessage.guild, 'message', 'Message edited', `**Author:** <@${newMessage.author.id}>\n**Channel:** <#${newMessage.channel.id}>\n**Before:** ${(oldMessage.content || '[empty]').slice(0, 1500)}\n**After:** ${(newMessage.content || '[empty]').slice(0, 1500)}`, 0xfee75c); });
+client.on('guildMemberAdd', m => logEvent(m.guild, 'member', 'Member joined', `**Member:** <@${m.id}>`, 0x57f287));
+client.on('guildMemberRemove', m => logEvent(m.guild, 'member', 'Member left', `**Member:** ${m.user?.tag || m.id}`, 0xed4245));
+client.on('voiceStateUpdate', (oldState, newState) => { if (oldState.channelId !== newState.channelId) logEvent(newState.guild, 'voice', 'Voice state updated', `**Member:** <@${newState.id}>\n**From:** ${oldState.channelId ? `<#${oldState.channelId}>` : 'None'}\n**To:** ${newState.channelId ? `<#${newState.channelId}>` : 'None'}`); });
+client.on('roleCreate', r => logEvent(r.guild, 'role', 'Role created', `**Role:** <@&${r.id}>\n**Name:** ${r.name}`, 0x57f287));
+client.on('roleDelete', r => logEvent(r.guild, 'role', 'Role deleted', `**Role:** ${r.name}`, 0xed4245));
+client.on('channelCreate', c => c.guild && logEvent(c.guild, 'server', 'Channel created', `**Channel:** <#${c.id}>\n**Name:** ${c.name}`, 0x57f287));
+client.on('channelDelete', c => c.guild && logEvent(c.guild, 'server', 'Channel deleted', `**Channel:** ${c.name}`, 0xed4245));
+client.on('guildBanAdd', b => logEvent(b.guild, 'moderation', 'Member banned', `**User:** ${b.user.tag}\n**ID:** ${b.user.id}`, 0xed4245));
+client.on('guildBanRemove', b => logEvent(b.guild, 'moderation', 'Member unbanned', `**User:** ${b.user.tag}\n**ID:** ${b.user.id}`, 0x57f287));
 
 client.once('ready', async () => {
   client.user.setPresence({ status: 'dnd', activities: [{ name: 'Lounge', type: ActivityType.Watching }] });
@@ -279,15 +220,6 @@ client.once('ready', async () => {
   console.log(`Lounge online as ${client.user.tag}`);
 });
 
-async function registerCommands() {
-  const rest = new REST({ version: '10' }).setToken(TOKEN);
-  const body = commands.map(command => command.data.toJSON());
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [] });
-  console.log(`[commands] ${body.length} guild commands registered; global commands cleared`);
-}
-
 process.on('unhandledRejection', error => console.error('[unhandledRejection]', error));
 process.on('uncaughtException', error => console.error('[uncaughtException]', error));
-
 client.login(TOKEN).catch(error => { console.error('[login] failed:', error); process.exit(1); });
