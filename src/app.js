@@ -90,7 +90,7 @@ async function handleSlash(i) {
   if (i.commandName === 'help') return respond(i, { embeds: [new EmbedBuilder().setTitle('Lounge Commands').setDescription(helpText())] });
   if (i.commandName === 'sticky') { const content = i.options.getString('message', true); const old = stickies.get(i.channelId); if (old?.messageId) await i.channel.messages.delete(old.messageId).catch(() => {}); const sent = await i.channel.send({ content, allowedMentions: { parse: [] } }); stickies.set(i.channelId, { messageId: sent.id, content }); return respond(i, '📌 Sticky message set.'); }
   if (i.commandName === 'stickyremove') { const old = stickies.get(i.channelId); if (!old) return respond(i, 'There is no sticky message here.'); await i.channel.messages.delete(old.messageId).catch(() => {}); stickies.delete(i.channelId); return respond(i, '🗑️ Sticky removed.'); }
-  if (i.commandName === 'logging') { const sub = i.options.getSubcommand(); if (sub === 'status') return respond(i, logs.has(i.guildId) ? `🟢 Logging is configured. **${Object.keys(logs.get(i.guildId).channels || {}).length}** channels active.` : '⚪ Logging is not configured.'); await i.deferReply({ ephemeral: true }); try { await setupLogging(i.guild); return respond(i, '✅ Lounge Logs setup complete.'); } catch (error) { return respond(i, `❌ ${error.message}`); } }
+  if (i.commandName === 'logging') { const sub = i.options.getSubcommand(); if (sub === 'status') return respond(i, logs.has(i.guildId) ? `🟢 Logging is configured. **${Object.keys(logs.get(i.guildId).channels || {}).length}** channels active.` : '⚪ Logging is not configured.'); try { await setupLogging(i.guild); return respond(i, '✅ Lounge Logs setup complete.'); } catch (error) { return respond(i, `❌ ${error.message}`); } }
   if (i.commandName === 'automod') {
     const cfg = getConfig(i.guildId); const sub = i.options.getSubcommand();
     if (sub === 'status') return respond(i, `AutoMod: **${cfg.enabled ? 'ON' : 'OFF'}** | Links: **${cfg.links ? 'BLOCKED' : 'ALLOWED'}** | Invites: **${cfg.invites ? 'BLOCKED' : 'ALLOWED'}** | GIF-only roles: **${cfg.gifOnly.roles.length}** | users: **${cfg.gifOnly.users.length}**`);
@@ -122,35 +122,17 @@ client.once('ready', async () => {
   console.log(`[Lounge] Logged in as ${client.user.tag} (${client.user.id})`);
   client.user.setPresence({ status: 'dnd', activities: [{ name: 'Lounge', type: ActivityType.Watching }] });
   const rest = new REST({ version: '10' }).setToken(TOKEN);
-  try {
-    await rest.put(Routes.applicationCommands(CLIENT_ID), { body: slash });
-    for (const guild of client.guilds.cache.values()) await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guild.id), { body: [] });
-    console.log(`[Lounge] Registered ${slash.length} global commands and cleared guild duplicates in ${client.guilds.cache.size} guild(s).`);
-  } catch (error) { console.error('[Lounge] Command registration failed:', error); }
+  try { await rest.put(Routes.applicationCommands(CLIENT_ID), { body: slash }); for (const guild of client.guilds.cache.values()) await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guild.id), { body: [] }); console.log(`[Lounge] Registered ${slash.length} global commands and cleared guild duplicates in ${client.guilds.cache.size} guild(s).`); }
+  catch (error) { console.error('[Lounge] Command registration failed:', error); }
 });
 
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
-  try { await handleSlash(interaction); }
-  catch (error) {
-    console.error(`[Lounge] /${interaction.commandName} failed:`, error);
-    const payload = { content: '❌ Something went wrong while running that command.', ephemeral: true };
-    try { if (interaction.deferred || interaction.replied) await interaction.editReply(payload); else await interaction.reply(payload); } catch {}
-  }
+  try { await interaction.deferReply(); await handleSlash(interaction); }
+  catch (error) { console.error(`[Lounge] /${interaction.commandName} failed:`, error); const payload = { content: '❌ Something went wrong while running that command.', ephemeral: true }; try { if (interaction.deferred || interaction.replied) await interaction.editReply(payload); else await interaction.reply(payload); } catch {} }
 });
 
-client.on('messageCreate', async message => {
-  try {
-    if (await handlePrefix(message)) return;
-    await runAutoMod(message);
-    const sticky = stickies.get(message.channelId);
-    if (sticky && message.id !== sticky.messageId) {
-      await message.channel.messages.delete(sticky.messageId).catch(() => {});
-      const sent = await message.channel.send({ content: sticky.content, allowedMentions: { parse: [] } });
-      sticky.messageId = sent.id;
-    }
-  } catch (error) { console.error('[Lounge] message handler error:', error); }
-});
+client.on('messageCreate', async message => { try { if (await handlePrefix(message)) return; await runAutoMod(message); const sticky = stickies.get(message.channelId); if (sticky && message.id !== sticky.messageId) { await message.channel.messages.delete(sticky.messageId).catch(() => {}); const sent = await message.channel.send({ content: sticky.content, allowedMentions: { parse: [] } }); sticky.messageId = sent.id; } } catch (error) { console.error('[Lounge] message handler error:', error); } });
 client.on('guildMemberAdd', member => logEvent(member.guild, 'member', 'Member joined', `<@${member.id}> joined the server.`));
 client.on('guildMemberRemove', member => logEvent(member.guild, 'member', 'Member left', `<@${member.id}> left the server.`));
 client.on('voiceStateUpdate', (oldState, newState) => { if (oldState.channelId === newState.channelId) return; const channel = newState.channel || oldState.channel; if (channel) logEvent(channel.guild, 'voice', 'Voice update', `<@${newState.id}> voice state changed.`); });
