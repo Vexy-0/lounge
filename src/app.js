@@ -25,6 +25,7 @@ const stickyLocks = new Set();
 const automod = new Map();
 const gifOnly = new Map();
 const spamTracker = new Map();
+const gifUrlCache = new Map();
 
 const DEFAULT_AUTOMOD = () => ({
   enabled: true,
@@ -45,17 +46,17 @@ const DEFAULT_AUTOMOD = () => ({
   exemptChannels: new Set(),
 });
 
-// Provider page URLs are accepted; arbitrary domains are NOT. Direct GIF files
-// are accepted when the URL path ends in .gif. This prevents normal images/files
-// on broad CDNs from slipping through the GIF-only rule.
+// Known GIF providers. Provider page URLs are valid GIF content even when
+// their URL does not end in .gif (for example Tenor/Giphy share URLs).
 const GIF_PAGE_HOSTS = new Set([
-  'giphy.com', 'media.giphy.com',
-  'tenor.com', 'media.tenor.com', 'c.tenor.com',
-  'redgifs.com', 'www.redgifs.com', 'media.redgifs.com',
+  'giphy.com', 'media.giphy.com', 'i.giphy.com',
+  'tenor.com', 'media.tenor.com', 'c.tenor.com', 'media1.tenor.com',
+  'redgifs.com', 'media.redgifs.com',
+  'gfycat.com', 'giant.gfycat.com',
 ]);
 const DIRECT_GIF_HOSTS = new Set([
   'cdn.discordapp.com', 'media.discordapp.net', 'images-ext-1.discordapp.net',
-  'i.imgur.com', 'imgur.com', 'gyazo.com',
+  'i.imgur.com', 'imgur.com', 'i.redd.it', 'preview.redd.it',
 ]);
 const URL_RE = /(?:https?:\/\/|www\.)[^\s<>()]+/gi;
 const MARKDOWN_URL_RE = /\[[^\]]*\]\((https?:\/\/[^\s)]+)\)/gi;
@@ -70,23 +71,54 @@ function extractUrls(text) {
   for (const m of text.matchAll(MARKDOWN_URL_RE)) urls.push(m[1]);
   return [...new Set(urls)];
 }
-function normalizeUrl(url) { return url.startsWith('www.') ? `https://${url}` : url; }
+function normalizeUrl(url) { return /^www\./i.test(url) ? `https://${url}` : url; }
 function getHost(url) { try { return new URL(normalizeUrl(url)).hostname.toLowerCase().replace(/^www\./, ''); } catch { return ''; } }
-function isGifUrl(url) {
+function isKnownGifHost(host) {
+  return [...GIF_PAGE_HOSTS].some(h => host === h || host.endsWith(`.${h}`));
+}
+function isGifExtension(url) {
   try {
     const parsed = new URL(normalizeUrl(url));
-    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
     const path = parsed.pathname.toLowerCase();
-    if (path.endsWith('.gif') || path.includes('.gif/')) return true;
-    return [...GIF_PAGE_HOSTS].some(h => host === h || host.endsWith(`.${h}`));
+    return /\.gif(?:$|\/)/.test(path) || /(?:^|[?&])(?:format|fm)=gif(?:$|&)/i.test(parsed.search);
   } catch { return false; }
 }
-function isDirectGifFile(url) {
+function isDirectGifHost(url) {
+  const host = getHost(url);
+  return [...DIRECT_GIF_HOSTS].some(h => host === h || host.endsWith(`.${h}`));
+}
+
+// Unknown GIF hosts are checked by Content-Type. This is what makes the
+// bypass work with arbitrary GIF/CDN URLs instead of maintaining a fragile
+// hard-coded list of websites. Results are cached briefly to avoid latency.
+async function isGifUrl(url) {
+  const normalized = normalizeUrl(url);
+  if (isGifExtension(normalized) || isKnownGifHost(getHost(normalized))) return true;
+  if (gifUrlCache.has(normalized)) {
+    const cached = gifUrlCache.get(normalized);
+    if (cached.expires > Date.now()) return cached.value;
+    gifUrlCache.delete(normalized);
+  }
   try {
-    const parsed = new URL(normalizeUrl(url));
-    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
-    return parsed.pathname.toLowerCase().endsWith('.gif') && [...DIRECT_GIF_HOSTS].some(h => host === h || host.endsWith(`.${h}`));
-  } catch { return false; }
+    const response = await fetch(normalized, {
+      method: 'HEAD',
+      redirect: 'follow',
+      signal: AbortSignal.timeout(2500),
+      headers: { 'User-Agent': 'Lounge-AutoMod/1.0' },
+    });
+    const type = (response.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+    const value = type === 'image/gif';
+    gifUrlCache.set(normalized, { value, expires: Date.now() + 5 * 60_000 });
+    return value;
+  } catch {
+    return false;
+  }
+}
+
+function isGifAttachment(file) {
+  const type = (file.contentType || '').toLowerCase().split(';', 1)[0].trim();
+  const name = (file.name || '').toLowerCase();
+  return type === 'image/gif' || name.endsWith('.gif');
 }
 function isGifOnlyMember(message) {
   const bypass = getGifBypass(message.guild.id);
@@ -120,17 +152,36 @@ function spamReason(message, config) {
 }
 async function checkGifOnly(message) {
   if (!isGifOnlyMember(message)) return false;
+
   const urls = extractUrls(message.content);
-  if (INVITE_RE.test(message.content)) { await punish(message, 'GIF-only bypass: Discord invites are not allowed'); return true; }
-  const nonGifUrls = urls.filter(url => !isGifUrl(url) && !isDirectGifFile(url));
-  const gifAttachments = [...message.attachments.values()].length > 0 && [...message.attachments.values()].every(file => (file.contentType || '').toLowerCase() === 'image/gif' || (file.name || '').toLowerCase().endsWith('.gif'));
-  const hasGifUrl = urls.length > 0 && urls.every(url => isGifUrl(url) || isDirectGifFile(url));
-  const hasOnlyGifContent = (urls.length > 0 && nonGifUrls.length === 0 && hasGifUrl) || gifAttachments;
-  if (nonGifUrls.length > 0 || !hasOnlyGifContent) {
-    await punish(message, 'GIF-only bypass: only GIF links or GIF files are allowed');
+  const attachments = [...message.attachments.values()];
+
+  // GIF-only members may send a GIF attachment, including Discord-hosted
+  // uploads, without needing a URL in the message content.
+  if (attachments.length > 0) {
+    const allGifAttachments = attachments.every(isGifAttachment);
+    const contentUrls = urls.length ? await Promise.all(urls.map(isGifUrl)) : [];
+    const allUrlsGif = contentUrls.every(Boolean);
+    if (allGifAttachments && allUrlsGif && !INVITE_RE.test(message.content)) return false;
+    await punish(message, 'GIF-only: only GIF links or GIF files are allowed');
     return true;
   }
-  return false;
+
+  if (!urls.length) {
+    await punish(message, 'GIF-only: only GIF links or GIF files are allowed');
+    return true;
+  }
+
+  if (INVITE_RE.test(message.content)) {
+    await punish(message, 'GIF-only: Discord invites are not allowed');
+    return true;
+  }
+
+  const results = await Promise.all(urls.map(isGifUrl));
+  if (results.every(Boolean)) return false;
+
+  await punish(message, 'GIF-only: only GIF links or GIF files are allowed');
+  return true;
 }
 async function runAutoMod(message) {
   if (!message.guild || message.author.bot || message.webhookId) return;
@@ -139,7 +190,10 @@ async function runAutoMod(message) {
   if (await checkGifOnly(message)) return;
   const urls = extractUrls(message.content);
   if (config.invites && INVITE_RE.test(message.content)) return punish(message, 'Discord invite links are not allowed');
-  if (config.links && urls.some(url => !isGifUrl(url) && !isDirectGifFile(url))) return punish(message, 'links are not allowed');
+  if (config.links && urls.length) {
+    const allowed = await Promise.all(urls.map(isGifUrl));
+    if (allowed.some(value => !value)) return punish(message, 'links are not allowed');
+  }
   if (config.words.size) {
     const lowered = message.content.toLowerCase();
     for (const word of config.words) if (lowered.includes(word.toLowerCase())) return punish(message, 'blocked word');
@@ -209,8 +263,8 @@ const commands = [
   { data: new SlashCommandBuilder().setName('ping').setDescription('Check the bot latency.'), execute: async i => i.reply(`🏓 Pong! ${client.ws.ping}ms`) },
   { data: new SlashCommandBuilder().setName('status').setDescription('Show bot status.'), execute: async i => i.reply({ embeds: [statusEmbed()] }) },
   { data: new SlashCommandBuilder().setName('help').setDescription('Show available commands.'), execute: async i => i.reply({ embeds: [helpEmbed()] }) },
-  { data: new SlashCommandBuilder().setName('sticky').setDescription('Create or replace the sticky message in this channel.').addStringOption(o => o.setName('message').setDescription('Message to keep at the bottom.').setRequired(true).setMaxLength(2000)).setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()), execute: async i => { if (!isManageMessages(i.member)) return i.reply({ content: '❌ Manage Messages is required.', ephemeral: true }); await i.deferReply({ ephemeral: true }); const ok = await setSticky(i.channel, i.options.getString('message', true), i.user.id); return i.editReply(ok ? '✅ Sticky message set.' : '⚠️ Sticky update already in progress.'); } },
-  { data: new SlashCommandBuilder().setName('stickyremove').setDescription('Remove the sticky message from this channel.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()), execute: async i => { if (!isManageMessages(i.member)) return i.reply({ content: '❌ Manage Messages is required.', ephemeral: true }); await i.deferReply({ ephemeral: true }); const ok = await removeSticky(i.channel); return i.editReply(ok ? '✅ Sticky removed.' : 'ℹ️ No sticky is set here.'); } },
+  { data: new SlashCommandBuilder().setName('sticky').setDescription('Create or replace the sticky message in this channel.').addStringOption(o => o.setName('message').setDescription('Message to keep at the bottom.').setRequired(true).setMaxLength(2000)).setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()), execute: async i => { if (!isManageMessages(i.member)) return i.reply({ content: '❌ Manage Messages is required.', ephemeral: true }); const ok = await setSticky(i.channel, i.options.getString('message', true), i.user.id).catch(() => false); return i.reply(ok ? '✅ Sticky message set.' : '⚠️ Sticky update already in progress.'); } },
+  { data: new SlashCommandBuilder().setName('stickyremove').setDescription('Remove the sticky message in this channel.').setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages.toString()), execute: async i => { if (!isManageMessages(i.member)) return i.reply({ content: '❌ Manage Messages is required.', ephemeral: true }); const ok = await removeSticky(i.channel).catch(() => false); return i.reply(ok ? '✅ Sticky removed.' : 'ℹ️ No sticky is set here.'); } },
   { data: automodData, execute: async i => {
     if (!isManageMessages(i.member)) return i.reply({ content: '❌ Manage Messages is required.', ephemeral: true });
     const c = getConfig(i.guildId); const sub = i.options.getSubcommand();
@@ -267,6 +321,6 @@ client.on('messageCreate', async message => {
   try { if (sticky.messageId === message.id) return; await message.channel.messages.delete(sticky.messageId).catch(() => {}); const sent = await message.channel.send({ content: sticky.content, allowedMentions: { parse: [] } }); stickies.set(message.channel.id, { ...sticky, messageId: sent.id }); }
   catch (e) { console.error(`Sticky bump failed in ${message.channel.id}:`, e); } finally { stickyLocks.delete(message.channel.id); }
 });
-setInterval(() => { const now = Date.now(); for (const [key, entries] of spamTracker) { const recent = entries.filter(e => now - e.time <= 10_000); if (recent.length) spamTracker.set(key, recent); else spamTracker.delete(key); } }, 30_000).unref();
+setInterval(() => { const now = Date.now(); for (const [key, entries] of spamTracker) { const recent = entries.filter(e => now - e.time <= 10_000); if (recent.length) spamTracker.set(key, recent); else spamTracker.delete(key); } for (const [url, entry] of gifUrlCache) { if (entry.expires <= now) gifUrlCache.delete(url); } }, 30_000).unref();
 process.on('unhandledRejection', e => console.error('Unhandled rejection:', e)); process.on('uncaughtException', e => console.error('Uncaught exception:', e));
 await client.login(TOKEN);
