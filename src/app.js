@@ -1,115 +1,129 @@
-﻿import 'dotenv/config';
-import { Client, Collection, GatewayIntentBits } from 'discord.js';
-import { REST } from '@discordjs/rest';
-import express from 'express';
-import cron from 'node-cron';
+import 'dotenv/config';
+import { Client, Collection, GatewayIntentBits, REST, Routes, SlashCommandBuilder, EmbedBuilder } from 'discord.js';
 
-import config from './config/application.js';
-import { initializeDatabase } from './utils/database.js';
-import { logger, startupLog, shutdownLog } from './utils/logger.js';
-import { checkBirthdays } from './services/birthdayService.js';
-import { loadCommands, registerCommands as registerSlashCommands } from './handlers/loaders/commandLoader.js';
-import { registerCriticalSlashCommands } from './services/criticalSlashRegistration.js';
-import { runSafeTask } from './utils/errorHandler.js';
-import pkg from '../package.json' with { type: 'json' };
-import { EXPECTED_SCHEMA_VERSION, EXPECTED_SCHEMA_LABEL } from './config/database/schemaVersion.js';
+const TOKEN = process.env.DISCORD_TOKEN || process.env.TOKEN;
+const CLIENT_ID = process.env.CLIENT_ID || process.env.DISCORD_CLIENT_ID;
+const GUILD_ID = process.env.GUILD_ID;
+const PREFIX = process.env.PREFIX || '!';
 
-class TitanBot extends Client {
-  constructor() {
-    super({
-      intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers, GatewayIntentBits.GuildMessages, GatewayIntentBits.GuildMessageReactions, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildBans],
-    });
-    this.config = config;
-    this.commands = new Collection();
-    this.events = new Collection();
-    this.buttons = new Collection();
-    this.selectMenus = new Collection();
-    this.modals = new Collection();
-    this.cooldowns = new Collection();
-    this.db = null;
-    this.rest = new REST({ version: '10' }).setToken(config.bot.token);
-  }
+if (!TOKEN) throw new Error('Missing DISCORD_TOKEN (or TOKEN).');
+if (!CLIENT_ID) throw new Error('Missing CLIENT_ID (Discord Application ID).');
+if (!GUILD_ID) throw new Error('Missing GUILD_ID (Discord Server ID).');
 
-  async start() {
-    try {
-      startupLog('Starting TitanBot...');
-      startupLog('Initializing database...');
-      const dbInstance = await initializeDatabase();
-      this.db = dbInstance.db;
-      const dbStatus = this.db.getStatus();
-      if (dbStatus.isDegraded) logger.warn('Database is running in degraded/in-memory mode; data will reset on restart.');
-      else startupLog(`✅ Database Status: ${dbStatus.connectionType} (fully operational)`);
-      startupLog('Starting web server...');
-      this.startWebServer();
-      startupLog('Loading commands...');
-      await loadCommands(this);
-      startupLog(`Commands loaded: ${this.commands.size}`);
-      startupLog('Loading handlers...');
-      await this.loadHandlers();
-      startupLog('Handlers loaded');
-      startupLog('Logging into Discord...');
-      await this.login(this.config.bot.token);
-      startupLog(`Discord login successful as ${this.user?.tag || this.user?.id}`);
-      startupLog(`Registering slash commands to guild ${this.config.bot.guildId}...`);
-      await this.registerCommands();
-      startupLog('Slash commands registration complete');
-      const databaseMode = dbStatus.isDegraded ? 'Optional in-memory mode (data resets after restart)' : 'Connected (persistent data enabled)';
-      const handlerSummary = `${this.buttons.size} buttons, ${this.selectMenus.size} menus, ${this.modals.size} modals`;
-      startupLog(`ONLINE ✅ | ${this.commands.size} commands loaded | ${handlerSummary} | Database: ${databaseMode}`);
-      this.setupCronJobs();
-    } catch (error) {
-      logger.error('Failed to start bot:', error);
-      process.exit(1);
-    }
-  }
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+  ],
+});
 
-  startWebServer() {
-    const app = express();
-    const configuredPort = Number(this.config.api?.port || process.env.PORT || 3000);
-    const maxPortRetryAttempts = Number(process.env.PORT_RETRY_ATTEMPTS || 5);
-    const host = process.env.WEB_HOST || '0.0.0.0';
-    const corsOrigin = this.config.api?.cors?.origin || '*';
-    app.use((req, res, next) => { const allowedOrigins = Array.isArray(corsOrigin) ? corsOrigin : [corsOrigin]; const origin = req.headers.origin; if (allowedOrigins.includes('*') || allowedOrigins.includes(origin)) res.header('Access-Control-Allow-Origin', origin || '*'); res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS'); res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization'); if (req.method === 'OPTIONS') return res.sendStatus(200); next(); });
-    const requestCounts = new Map(); const windowMs = this.config.api?.rateLimit?.windowMs || 60000; const maxRequests = this.config.api?.rateLimit?.max || 100;
-    app.use((req, res, next) => { const ip = req.ip; const now = Date.now(); const times = (requestCounts.get(ip) || []).filter(t => t > now - windowMs); if (times.length >= maxRequests) return res.status(429).json({ error: 'Too many requests' }); times.push(now); requestCounts.set(ip, times); next(); });
-    app.get('/health', (req, res) => { const dbStatus = this.db?.getStatus?.() || { isDegraded: 'unknown' }; res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString(), uptime: process.uptime(), database: { connected: dbStatus.connectionType !== 'none', degraded: dbStatus.isDegraded, type: dbStatus.connectionType } }); });
-    app.get('/ready', (req, res) => { const dbStatus = this.db?.getStatus?.() || { isDegraded: true, connectionType: 'none' }; const isReady = this.isReady() && !dbStatus.isDegraded; const metrics = { guildCount: this.guilds?.cache?.size ?? 0, commandCount: this.commands?.size ?? 0, database: { mode: dbStatus.connectionType, degraded: dbStatus.isDegraded, degradedReason: dbStatus.degradedReason ?? null }, schemaVersion: EXPECTED_SCHEMA_VERSION, schemaLabel: EXPECTED_SCHEMA_LABEL }; if (isReady) return res.status(200).json({ ready: true, message: 'Bot is ready', metrics }); return res.status(503).json({ ready: false, reason: !this.isReady() ? 'Bot not Ready' : 'Database degraded', metrics }); });
-    app.get('/', (req, res) => res.status(200).json({ message: 'TitanBot System Online', version: pkg.version, timestamp: new Date().toISOString() }));
-    const startServer = (port, attempt = 0) => { let hasStartedListening = false; const server = app.listen(port, host, () => { hasStartedListening = true; this.webServer = server; startupLog(`✅ Web Server running on ${host}:${port}`); }); server.on('error', error => { if (!hasStartedListening && error?.code === 'EADDRINUSE' && attempt < maxPortRetryAttempts) { const nextPort = port + 1; startupLog(`Port ${port} is already in use. Trying port ${nextPort}...`); setTimeout(() => startServer(nextPort, attempt + 1), 250); return; } logger.error(`❌ Web server error on port ${port}: ${error?.message || error}`); if (!hasStartedListening) process.exit(1); }); };
-    startServer(configuredPort, 0);
-  }
+client.commands = new Collection();
+const startedAt = Date.now();
 
-  setupCronJobs() { cron.schedule('0 6 * * *', runSafeTask('birthday_check', () => checkBirthdays(this))); }
+const commands = [
+  {
+    data: new SlashCommandBuilder().setName('ping').setDescription('Check the bot latency.'),
+    execute: async (interaction) => interaction.reply(`🏓 Pong! ${client.ws.ping}ms`),
+  },
+  {
+    data: new SlashCommandBuilder().setName('status').setDescription('Show bot status.'),
+    execute: async (interaction) => {
+      const uptime = Math.floor((Date.now() - startedAt) / 1000);
+      await interaction.reply({ embeds: [statusEmbed(uptime)] });
+    },
+  },
+  {
+    data: new SlashCommandBuilder().setName('help').setDescription('Show available commands.'),
+    execute: async (interaction) => interaction.reply({ embeds: [helpEmbed()] }),
+  },
+];
 
-  async loadHandlers() {
-    startupLog('Loading handlers...');
-    const handlers = [{ path: 'events', type: 'default', required: true }, { path: 'interactions', type: 'default', required: true }];
-    for (const handler of handlers) {
-      try { startupLog(`Loading handler: ${handler.path}`); const module = await import(`./handlers/loaders/${handler.path}.js`); const loaderFn = handler.type.startsWith('named:') ? module[handler.type.split(':')[1]] : module.default; if (typeof loaderFn !== 'function') throw new Error(`Invalid loader export from ${handler.path}`); await loaderFn(this); startupLog(`✅ Loaded ${handler.path}`); }
-      catch (error) { if (handler.required) { logger.error(`❌ Failed to load required handler ${handler.path}:`, error.message); throw error; } if (error.code !== 'MODULE_NOT_FOUND') logger.warn(`⚠️ Failed to load optional handler ${handler.path}:`, error.message); }
-    }
-  }
+for (const command of commands) client.commands.set(command.data.name, command);
 
-  async registerCommands() {
-    const clientId = this.config.bot.clientId; const guildId = this.config.bot.guildId;
-    if (!clientId) throw new Error('CLIENT_ID is missing from Railway environment variables.');
-    if (!guildId) throw new Error('GUILD_ID is missing from Railway environment variables. Refusing global-only registration so testing is deterministic.');
-    if (this.user?.id !== clientId) throw new Error(`CLIENT_ID mismatch: configured ${clientId}, logged-in bot is ${this.user?.id}.`);
-    try { await registerSlashCommands(this, { clientId, guildId }); startupLog(`Registered ${this.commands.size} standard guild slash commands.`); const critical = await registerCriticalSlashCommands(this, { clientId, guildId }); startupLog(`Verified critical slash commands: ${critical.join(', ')}`); }
-    catch (error) { logger.error('Error registering commands:', error); throw error; }
-  }
-
-  async shutdown(reason = 'UNKNOWN') {
-    shutdownLog(`Bot is shutting down (${reason})...`);
-    try { cron.getTasks().forEach(task => task.stop()); if (this.webServer) await new Promise(resolve => this.webServer.close(resolve)); if (this.db && this.db.db) { try { if (this.db.db.pool) await this.db.db.pool.end(); else if (typeof this.db.db.close === 'function') await this.db.db.close(); } catch (error) { logger.warn(`Database close warning: ${error.message}`); } } this.destroy(); shutdownLog('Bot shutdown complete.'); }
-    catch (error) { logger.error('Error during shutdown:', error); }
-  }
+function statusEmbed(uptime) {
+  return new EmbedBuilder()
+    .setTitle('Lounge Status')
+    .setDescription('The bot is online and responding normally.')
+    .addFields(
+      { name: 'Status', value: '🟢 Online', inline: true },
+      { name: 'Latency', value: `${client.ws.ping}ms`, inline: true },
+      { name: 'Uptime', value: `${uptime}s`, inline: true },
+      { name: 'Servers', value: `${client.guilds.cache.size}`, inline: true },
+      { name: 'Memory', value: `${Math.round(process.memoryUsage().rss / 1024 / 1024)} MB`, inline: true },
+    );
 }
 
-const bot = new TitanBot();
-process.on('SIGINT', () => bot.shutdown('SIGINT'));
-process.on('SIGTERM', () => bot.shutdown('SIGTERM'));
-process.on('unhandledRejection', error => logger.error('Unhandled promise rejection:', error));
-process.on('uncaughtException', error => logger.error('Uncaught exception:', error));
-bot.start();
-export default bot;
+function helpEmbed() {
+  return new EmbedBuilder()
+    .setTitle('Lounge Commands')
+    .setDescription([
+      `**Slash commands**`,
+      '`/ping` — Check latency',
+      '`/status` — Bot health/status',
+      '`/help` — Show this menu',
+      '',
+      `**Prefix commands**`,
+      '`!ping` — Check latency',
+      '`!status` — Bot health/status',
+      '`!help` — Show this menu',
+    ].join('\n'));
+}
+
+async function registerCommands() {
+  const rest = new REST({ version: '10' }).setToken(TOKEN);
+  const body = commands.map(command => command.data.toJSON());
+  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
+  console.log(`Registered ${body.length} guild slash commands.`);
+}
+
+client.once('ready', async () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  try {
+    await registerCommands();
+    console.log('Slash commands registered successfully.');
+  } catch (error) {
+    console.error('Slash command registration failed:', error);
+  }
+  console.log(`Lounge is online. Prefix: ${PREFIX}`);
+});
+
+client.on('interactionCreate', async (interaction) => {
+  if (!interaction.isChatInputCommand()) return;
+  const command = client.commands.get(interaction.commandName);
+  if (!command) return;
+  try {
+    await command.execute(interaction);
+  } catch (error) {
+    console.error(`Command /${interaction.commandName} failed:`, error);
+    const response = { content: '❌ Something went wrong while running that command.', ephemeral: true };
+    if (interaction.replied || interaction.deferred) await interaction.followUp(response).catch(() => {});
+    else await interaction.reply(response).catch(() => {});
+  }
+});
+
+client.on('messageCreate', async (message) => {
+  if (message.author.bot || !message.guild) return;
+  if (!message.content.startsWith(PREFIX)) return;
+
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const name = (args.shift() || '').toLowerCase();
+  if (!name) return;
+
+  const command = client.commands.get(name);
+  if (!command) return;
+
+  try {
+    if (name === 'ping') await message.reply(`🏓 Pong! ${client.ws.ping}ms`);
+    else if (name === 'status') await message.reply({ embeds: [statusEmbed(Math.floor((Date.now() - startedAt) / 1000))] });
+    else if (name === 'help') await message.reply({ embeds: [helpEmbed()] });
+  } catch (error) {
+    console.error(`Prefix command ${PREFIX}${name} failed:`, error);
+  }
+});
+
+process.on('unhandledRejection', error => console.error('Unhandled rejection:', error));
+process.on('uncaughtException', error => console.error('Uncaught exception:', error));
+
+await client.login(TOKEN);
