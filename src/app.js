@@ -21,9 +21,6 @@ const client = new Client({
 
 client.commands = new Collection();
 const startedAt = Date.now();
-
-// Sticky state is intentionally kept in memory: no database/background worker is
-// needed for this small bot. A restart simply clears active stickies.
 const stickies = new Map();
 const stickyLocks = new Set();
 
@@ -67,10 +64,7 @@ function helpEmbed() {
 
 async function sendSticky(channel, sticky) {
   const existing = stickies.get(channel.id);
-  if (existing?.messageId) {
-    await channel.messages.delete(existing.messageId).catch(() => {});
-  }
-
+  if (existing?.messageId) await channel.messages.delete(existing.messageId).catch(() => {});
   const sent = await channel.send({ content: sticky.content, allowedMentions: { parse: [] } });
   stickies.set(channel.id, { ...sticky, messageId: sent.id });
   return sent;
@@ -134,9 +128,8 @@ const commands = [
       if (!isManageMessages(interaction.member)) {
         return interaction.reply({ content: '❌ You need **Manage Messages** to use this command.', ephemeral: true });
       }
-      const content = interaction.options.getString('message', true);
       await interaction.deferReply({ ephemeral: true });
-      const created = await setSticky(interaction.channel, content, interaction.user.id);
+      const created = await setSticky(interaction.channel, interaction.options.getString('message', true), interaction.user.id);
       await interaction.editReply(created ? '✅ Sticky message set for this channel.' : '⚠️ A sticky update is already in progress.');
     },
   },
@@ -162,13 +155,13 @@ async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   const body = commands.map(command => command.data.toJSON());
 
-  // One authoritative command list, written to both scopes. This removes all
-  // stale commands from earlier versions and prevents duplicate command sets.
+  // Commands are intentionally guild-only. Clearing global commands prevents
+  // old global registrations from appearing beside the current commands.
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body });
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: [] });
 
-  console.log(`Registered exactly ${body.length} slash commands.`);
-  console.log(`Active slash commands: ${body.map(command => `/${command.name}`).join(', ')}`);
+  console.log(`Registered ${body.length} guild slash commands.`);
+  console.log(`Cleared global slash commands. Active: ${body.map(command => `/${command.name}`).join(', ')}`);
 }
 
 client.once('ready', async () => {
@@ -210,8 +203,6 @@ client.on('interactionCreate', async (interaction) => {
 client.on('messageCreate', async (message) => {
   if (message.author.bot || !message.guild) return;
 
-  // Prefix commands are handled before sticky bumping so command messages are
-  // never unnecessarily deleted/reposted as sticky content.
   if (message.content.startsWith(PREFIX)) {
     const raw = message.content.slice(PREFIX.length).trim();
     const [name, ...args] = raw.split(/\s+/);
@@ -262,12 +253,9 @@ client.on('messageCreate', async (message) => {
       await message.reply(removed ? '✅ Sticky message removed.' : 'ℹ️ There is no sticky message in this channel.').catch(() => {});
       return;
     }
-
     return;
   }
 
-  // If this channel has a sticky, keep it at the bottom by deleting the old
-  // copy and sending the configured content again after each user message.
   const sticky = stickies.get(message.channel.id);
   if (!sticky || stickyLocks.has(message.channel.id)) return;
 
