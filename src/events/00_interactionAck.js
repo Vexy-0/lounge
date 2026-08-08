@@ -4,16 +4,15 @@ import { logger } from '../utils/logger.js';
 function stripReplyOnlyFlags(options) {
   if (!options || typeof options !== 'object') return options;
   const { ephemeral, ...rest } = options;
-  // Ephemeral is selected when the interaction is deferred, so it must not be
-  // sent again to editReply. Keeping components/embeds/content untouched.
   return rest;
 }
 
 /**
- * Acknowledge slash commands immediately and make every normal reply complete
- * the deferred interaction. Without this bridge Discord can remain on
- * "Lounge is thinking..." when a command calls interaction.reply() after the
- * interaction was already deferred.
+ * Acknowledge slash commands immediately and expose the acknowledgement promise
+ * so later InteractionCreate listeners can wait for Discord's initial response.
+ * EventEmitter does not await one listener before starting the next listener,
+ * so storing the promise prevents a race where a command calls reply() before
+ * deferReply() has completed.
  */
 export default {
   name: Events.InteractionCreate,
@@ -39,11 +38,23 @@ export default {
         interaction.__loungeReplyBridgeInstalled = true;
       }
 
-      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-      interaction.__loungeSlashDeferred = true;
-      logger.debug(`Slash command acknowledged: /${interaction.commandName}`);
+      interaction.__loungeAckPromise = interaction.deferReply({ flags: MessageFlags.Ephemeral })
+        .then(() => {
+          interaction.__loungeSlashDeferred = true;
+          logger.debug(`Slash command acknowledged: /${interaction.commandName}`);
+        })
+        .catch(error => {
+          logger.error(`Failed to acknowledge /${interaction.commandName}:`, error);
+          throw error;
+        });
+
+      await interaction.__loungeAckPromise;
     } catch (error) {
-      logger.error(`Failed to acknowledge /${interaction.commandName}:`, error);
+      // Keep the promise rejected/visible to downstream handlers, but do not
+      // throw from the acknowledgement listener itself and create an unhandled
+      // interaction event failure.
+      interaction.__loungeAckPromise = Promise.resolve();
+      logger.error(`Slash acknowledgement failed for /${interaction.commandName}:`, error);
     }
   },
 };
