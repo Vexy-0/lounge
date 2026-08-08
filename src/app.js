@@ -22,6 +22,8 @@ const client = new Client({
 client.commands = new Collection();
 const startedAt = Date.now();
 
+// This is the complete command allowlist for the fresh bot.
+// Discord's bulk overwrite endpoint removes stale commands that are not here.
 const commands = [
   {
     data: new SlashCommandBuilder().setName('ping').setDescription('Check the bot latency.'),
@@ -59,12 +61,12 @@ function helpEmbed() {
   return new EmbedBuilder()
     .setTitle('Lounge Commands')
     .setDescription([
-      `**Slash commands**`,
+      '**Slash commands**',
       '`/ping` — Check latency',
       '`/status` — Bot health/status',
       '`/help` — Show this menu',
       '',
-      `**Prefix commands**`,
+      '**Prefix commands**',
       '`!ping` — Check latency',
       '`!status` — Bot health/status',
       '`!help` — Show this menu',
@@ -74,15 +76,23 @@ function helpEmbed() {
 async function registerCommands() {
   const rest = new REST({ version: '10' }).setToken(TOKEN);
   const body = commands.map(command => command.data.toJSON());
+
+  // Clear stale guild commands immediately.
   await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body });
-  console.log(`Registered ${body.length} guild slash commands.`);
+
+  // Older versions of Lounge registered commands globally. Clear that old
+  // global command set too, otherwise Discord can continue showing them.
+  await rest.put(Routes.applicationCommands(CLIENT_ID), { body });
+
+  console.log(`Registered exactly ${body.length} slash commands in the guild and globally.`);
+  console.log(`Active slash commands: ${body.map(command => `/${command.name}`).join(', ')}`);
 }
 
 client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
+  console.log(`Logged in as ${client.user.tag} (${client.user.id})`);
   try {
     await registerCommands();
-    console.log('Slash commands registered successfully.');
+    console.log('Slash command cleanup/registration completed successfully.');
   } catch (error) {
     console.error('Slash command registration failed:', error);
   }
@@ -92,7 +102,11 @@ client.once('ready', async () => {
 client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   const command = client.commands.get(interaction.commandName);
-  if (!command) return;
+  if (!command) {
+    await interaction.reply({ content: '❌ That command is no longer available.', ephemeral: true }).catch(() => {});
+    return;
+  }
+
   try {
     await command.execute(interaction);
   } catch (error) {
